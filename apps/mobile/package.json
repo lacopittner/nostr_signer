@@ -1,0 +1,25 @@
+{
+  "name": "@nostr-signer/mobile",
+  "version": "0.1.0",
+  "private": true,
+  "main": "expo/AppEntry",
+  "scripts": {
+    "dev": "expo start",
+    "ios": "expo run:ios",
+    "android": "expo run:android",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "expo export --platform all"
+  },
+  "dependencies": {
+    "@nostr-signer/signer-core": "0.1.0",
+    "@react-native-async-storage/async-storage": "^2.1.0",
+    "expo": "~52.0.0",
+    "expo-linear-gradient": "~14.0.0",
+    "react": "18.3.1",
+    "react-native": "0.76.3"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.9",
+    "typescript": "^5.7.3"
+  }
+}

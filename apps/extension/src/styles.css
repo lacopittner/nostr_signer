@@ -1,0 +1,229 @@
+:root {
+  color-scheme: light;
+  font-family: "Manrope", "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
+  --bg-gradient: radial-gradient(circle at 20% -10%, #f9dbc6 0%, #f4f0e8 42%, #ece9e0 100%);
+  --panel: rgba(255, 255, 255, 0.88);
+  --panel-border: rgba(49, 51, 45, 0.12);
+  --text-primary: #23231f;
+  --text-secondary: #5d6054;
+  --accent: #205d8f;
+  --accent-strong: #173f60;
+  --danger: #8d2036;
+  --success: #1d7746;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-gradient);
+  min-width: 380px;
+  min-height: 620px;
+  color: var(--text-primary);
+}
+
+.app-shell {
+  padding: 16px;
+  display: grid;
+  gap: 14px;
+}
+
+.hero-card,
+.identity-card,
+.status-card {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 18px;
+  backdrop-filter: blur(10px);
+}
+
+.hero-card {
+  padding: 16px;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+h1 {
+  margin: 4px 0 6px;
+  font-size: 1.15rem;
+}
+
+.hero-copy {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.84rem;
+  line-height: 1.3;
+  max-width: 220px;
+}
+
+.ghost-button,
+.primary-button,
+.secondary-button,
+.mini {
+  border-radius: 12px;
+  border: 1px solid transparent;
+  padding: 9px 12px;
+  font-weight: 700;
+  font-size: 0.78rem;
+  cursor: pointer;
+  transition: transform 130ms ease, box-shadow 130ms ease;
+}
+
+.ghost-button {
+  background: rgba(32, 93, 143, 0.1);
+  border-color: rgba(32, 93, 143, 0.3);
+  color: var(--accent-strong);
+  height: fit-content;
+}
+
+.primary-button {
+  background: linear-gradient(135deg, #205d8f 0%, #173f60 100%);
+  color: #ffffff;
+  box-shadow: 0 10px 24px rgba(23, 63, 96, 0.24);
+}
+
+.secondary-button {
+  background: rgba(255, 255, 255, 0.92);
+  border-color: rgba(49, 51, 45, 0.16);
+  color: var(--text-primary);
+}
+
+.mini {
+  background: rgba(255, 255, 255, 0.9);
+  border-color: rgba(49, 51, 45, 0.2);
+  color: var(--text-primary);
+  padding: 6px 10px;
+  font-size: 0.72rem;
+}
+
+.mini.danger {
+  color: var(--danger);
+  border-color: rgba(141, 32, 54, 0.3);
+}
+
+.ghost-button:hover,
+.primary-button:hover,
+.secondary-button:hover,
+.mini:hover {
+  transform: translateY(-1px);
+}
+
+.identity-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.identity-card {
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+  transition: border-color 140ms ease, transform 140ms ease;
+}
+
+.identity-card.active {
+  border-color: rgba(32, 93, 143, 0.35);
+  transform: translateY(-1px);
+}
+
+.identity-main {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.avatar {
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  color: #ffffff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+}
+
+.identity-content {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.identity-content strong {
+  font-size: 0.92rem;
+}
+
+.identity-content span,
+.identity-content small {
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.identity-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.status-pill {
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.status-pill.open {
+  background: rgba(29, 119, 70, 0.14);
+  color: var(--success);
+}
+
+.status-pill.locked {
+  background: rgba(141, 32, 54, 0.12);
+  color: var(--danger);
+}
+
+.action-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.status-card {
+  padding: 12px;
+}
+
+.status-card strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.status-card p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.status-card .error {
+  margin-top: 6px;
+  color: var(--danger);
+}

@@ -1,0 +1,18 @@
+{
+  "name": "nostr-signer",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "dev:extension": "npm run dev -w @nostr-signer/extension",
+    "dev:mobile": "npm run dev -w @nostr-signer/mobile"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

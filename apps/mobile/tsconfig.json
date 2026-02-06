@@ -1,0 +1,12 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "baseUrl": ".",
+    "paths": {
+      "@nostr-signer/signer-core": ["../../packages/signer-core/src/index.ts"],
+      "@nostr-signer/signer-core/*": ["../../packages/signer-core/src/*"]
+    }
+  },
+  "include": ["App.tsx", "src"]
+}
