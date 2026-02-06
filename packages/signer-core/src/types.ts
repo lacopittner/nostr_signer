@@ -21,24 +21,17 @@ export interface IdentityRecord {
   color: string;
   createdAt: number;
   lastUsedAt: number;
-  // Encrypted private key - only decrypted when identity is unlocked
   encryptedPrivateKey?: string;
 }
 
 export interface VaultState {
   identities: IdentityRecord[];
   activeIdentityId: string | null;
-  unlockedSessions: Record<string, number>;
-  // Map of identityId -> decrypted private key (only in memory, never persisted)
-  sessionKeys?: Record<string, string>;
-}
-
-export interface NewIdentityInput {
-  label: string;
-  pubkey: string;
-  npub?: string;
-  color?: string;
-  encryptedPrivateKey: string;
+  // Global PIN hash
+  pinHash?: string;
+  // Session state (never persisted)
+  unlockedAt: number | null;
+  masterKey: string | null;
 }
 
 export interface SignEventInput {
@@ -66,10 +59,4 @@ export interface SignerAdapter {
 export interface VaultStorage {
   load(): Promise<VaultState | null>;
   save(state: VaultState): Promise<void>;
-}
-
-export interface CryptoAdapter {
-  encrypt(data: string, password: string): Promise<string>;
-  decrypt(encryptedData: string, password: string): Promise<string | null>;
-  hashPassword(password: string): Promise<string>;
 }

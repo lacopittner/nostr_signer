@@ -1,33 +1,37 @@
 import {
   IdentityVault,
   RealSignerAdapter,
-  type CryptoAdapter,
-} from "@nostr-signer/signer-core";
-import {
-  encryptPrivateKey,
-  decryptPrivateKey,
-  hashPassword,
+  createEmptyVaultState,
+  type VaultState,
+  type VaultStorage,
 } from "@nostr-signer/signer-core";
 import browser from "webextension-polyfill";
-import type { VaultState, VaultStorage } from "@nostr-signer/signer-core";
 
-const STORAGE_KEY = "nostr_signer_vault_v2";
+const STORAGE_KEY = "nostr_signer_vault_v3";
 
 class ChromeVaultStorage implements VaultStorage {
   async load(): Promise<VaultState | null> {
     try {
       const result = await browser.storage.local.get(STORAGE_KEY);
-      return result[STORAGE_KEY] ?? null;
+      const stored = result[STORAGE_KEY];
+      if (!stored) return null;
+      // Always clear session data on load
+      return {
+        ...stored,
+        unlockedAt: null,
+        masterKey: null,
+      };
     } catch {
       return null;
     }
   }
 
   async save(state: VaultState): Promise<void> {
-    // Never save session keys to storage!
+    // Never save session data
     const safeState = {
       ...state,
-      sessionKeys: {},
+      unlockedAt: null,
+      masterKey: null,
     };
     try {
       await browser.storage.local.set({ [STORAGE_KEY]: safeState });
@@ -37,23 +41,8 @@ class ChromeVaultStorage implements VaultStorage {
   }
 }
 
-class WebCryptoAdapter implements CryptoAdapter {
-  async encrypt(data: string, password: string): Promise<string> {
-    return encryptPrivateKey(data, password);
-  }
-
-  async decrypt(encryptedData: string, password: string): Promise<string | null> {
-    return decryptPrivateKey(encryptedData, password);
-  }
-
-  async hashPassword(password: string): Promise<string> {
-    return hashPassword(password);
-  }
-}
-
 // Create singleton vault instance
 export const vault = new IdentityVault(
   new ChromeVaultStorage(),
-  new RealSignerAdapter(),
-  new WebCryptoAdapter()
+  new RealSignerAdapter()
 );

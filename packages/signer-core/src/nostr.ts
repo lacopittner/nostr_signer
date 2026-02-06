@@ -72,14 +72,13 @@ export class RealSignerAdapter implements SignerAdapter {
 }
 
 // Simple crypto for key encryption (AES-GCM with PBKDF2)
-export async function encryptPrivateKey(
-  privateKey: string,
+export async function encryptWithPassword(
+  data: string,
   password: string
 ): Promise<string> {
   const encoder = new TextEncoder();
-  const data = encoder.encode(privateKey);
+  const dataBytes = encoder.encode(data);
   
-  // Derive key from password
   const keyMaterial = await crypto.subtle.importKey(
     "raw",
     encoder.encode(password),
@@ -106,10 +105,9 @@ export async function encryptPrivateKey(
   const encrypted = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv },
     key,
-    data
+    dataBytes
   );
   
-  // Combine: salt + iv + ciphertext
   const result = new Uint8Array(salt.length + iv.length + encrypted.byteLength);
   result.set(salt);
   result.set(iv, salt.length);
@@ -118,12 +116,12 @@ export async function encryptPrivateKey(
   return btoa(String.fromCharCode(...result));
 }
 
-export async function decryptPrivateKey(
-  encryptedKey: string,
+export async function decryptWithPassword(
+  encryptedData: string,
   password: string
 ): Promise<string | null> {
   try {
-    const data = Uint8Array.from(atob(encryptedKey), (c) => c.charCodeAt(0));
+    const data = Uint8Array.from(atob(encryptedData), (c) => c.charCodeAt(0));
     
     const salt = data.slice(0, 16);
     const iv = data.slice(16, 28);
