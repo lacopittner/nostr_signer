@@ -1,11 +1,4 @@
-type CrossBrowserManifest = chrome.runtime.ManifestV3 & {
-  browser_specific_settings?: {
-    gecko: {
-      id: string;
-      strict_min_version: string;
-    };
-  };
-};
+import type { CrossBrowserManifest } from "./manifest";
 
 const manifest: CrossBrowserManifest = {
   manifest_version: 3,
@@ -22,6 +15,20 @@ const manifest: CrossBrowserManifest = {
     service_worker: "src/background.ts",
     type: "module",
   },
+  content_scripts: [
+    {
+      matches: ["<all_urls>"],
+      js: ["src/content.ts"],
+      run_at: "document_start",
+      world: "MAIN",
+    },
+  ],
+  web_accessible_resources: [
+    {
+      resources: ["src/inpage.ts"],
+      matches: ["<all_urls>"],
+    },
+  ],
   browser_specific_settings: {
     gecko: {
       id: "nostr-signer@local",

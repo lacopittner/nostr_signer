@@ -1,6 +1,122 @@
 import { useCallback, useEffect, useState } from "react";
 import type { IdentityRecord } from "@nostr-signer/signer-core";
 import { vault } from "./lib/vault";
+import browser from "webextension-polyfill";
+
+// Sign Request Confirmation Screen
+function SignRequestScreen({
+  requestId,
+  origin,
+  event,
+  onComplete,
+}: {
+  requestId: string;
+  origin: string;
+  event: any;
+  onComplete: () => void;
+}) {
+  const [loading, setLoading] = useState(false);
+
+  const handleApprove = async () => {
+    setLoading(true);
+    try {
+      await browser.runtime.sendMessage({
+        type: "APPROVE_REQUEST",
+        requestId,
+      });
+      onComplete();
+    } catch (err) {
+      alert("Failed to sign: " + (err instanceof Error ? err.message : "Unknown error"));
+      setLoading(false);
+    }
+  };
+
+  const handleReject = async () => {
+    await browser.runtime.sendMessage({
+      type: "REJECT_REQUEST",
+      requestId,
+    });
+    onComplete();
+  };
+
+  return (
+    <div style={{ padding: "20px", maxWidth: "360px" }}>
+      <h2 style={{ marginBottom: "8px" }}>Sign Request</h2>
+      <p style={{ color: "#666", marginBottom: "20px", fontSize: "14px" }}>
+        <strong>{origin}</strong> wants to sign a Nostr event
+      </p>
+
+      <div
+        style={{
+          background: "#f5f5f5",
+          padding: "12px",
+          borderRadius: "8px",
+          marginBottom: "20px",
+          fontSize: "13px",
+        }}
+      >
+        <div style={{ marginBottom: "8px" }}>
+          <strong>Kind:</strong> {event.kind}
+        </div>
+        <div style={{ marginBottom: "8px" }}>
+          <strong>Content:</strong>
+          <div
+            style={{
+              marginTop: "4px",
+              padding: "8px",
+              background: "white",
+              borderRadius: "4px",
+              wordBreak: "break-word",
+              maxHeight: "100px",
+              overflow: "auto",
+            }}
+          >
+            {event.content}
+          </div>
+        </div>
+        {event.tags?.length > 0 && (
+          <div>
+            <strong>Tags:</strong> {event.tags.length}
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: "flex", gap: "8px" }}>
+        <button
+          onClick={handleReject}
+          disabled={loading}
+          style={{
+            flex: 1,
+            padding: "12px",
+            background: "#f0f0f0",
+            border: "none",
+            borderRadius: "8px",
+            cursor: "pointer",
+            fontSize: "14px",
+          }}
+        >
+          Reject
+        </button>
+        <button
+          onClick={handleApprove}
+          disabled={loading}
+          style={{
+            flex: 1,
+            padding: "12px",
+            background: "#6d4aff",
+            color: "white",
+            border: "none",
+            borderRadius: "8px",
+            cursor: "pointer",
+            fontSize: "14px",
+          }}
+        >
+          {loading ? "Signing..." : "Approve"}
+        </button>
+      </div>
+    </div>
+  );
+}
 
 // PIN Lock Screen
 function PinLockScreen({ onUnlock }: { onUnlock: () => void }) {
@@ -197,6 +313,13 @@ export default function App() {
   const [hasPin, setHasPin] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   
+  // Pending sign request
+  const [pendingRequest, setPendingRequest] = useState<{
+    id: string;
+    origin: string;
+    event: any;
+  } | null>(null);
+  
   // Modals
   const [showCreate, setShowCreate] = useState(false);
   const [showImport, setShowImport] = useState(false);
@@ -217,6 +340,32 @@ export default function App() {
 
   useEffect(() => {
     const init = async () => {
+      // Check for pending sign request first
+      try {
+        const session = await browser.storage.session.get([
+          "pendingRequestId",
+          "pendingOrigin",
+          "pendingEvent",
+        ]);
+        if (session.pendingRequestId) {
+          setPendingRequest({
+            id: session.pendingRequestId,
+            origin: session.pendingOrigin,
+            event: session.pendingEvent,
+          });
+          // Clear from storage
+          await browser.storage.session.remove([
+            "pendingRequestId",
+            "pendingOrigin",
+            "pendingEvent",
+          ]);
+          setIsLoading(false);
+          return;
+        }
+      } catch {
+        // Session storage not available
+      }
+
       const pinSet = await vault.isPinSet();
       setHasPin(pinSet);
       
@@ -325,6 +474,21 @@ export default function App() {
 
   if (isLoading) {
     return <div style={{ padding: 40, textAlign: "center" }}>Loading...</div>;
+  }
+
+  // Show sign request confirmation first
+  if (pendingRequest) {
+    return (
+      <SignRequestScreen
+        requestId={pendingRequest.id}
+        origin={pendingRequest.origin}
+        event={pendingRequest.event}
+        onComplete={() => {
+          setPendingRequest(null);
+          refresh();
+        }}
+      />
+    );
   }
 
   if (!hasPin) {
