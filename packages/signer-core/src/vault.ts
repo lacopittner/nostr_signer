@@ -1,4 +1,4 @@
-import { computeEventId, hashHex, serializeEvent } from "./nostr";
+import { computeEventId, serializeEvent } from "./nostr";
 import type {
   IdentityRecord,
   NewIdentityInput,
@@ -8,10 +8,12 @@ import type {
   SignerAdapter,
   VaultState,
   VaultStorage,
+  CryptoAdapter,
 } from "./types";
 
 const DEFAULT_UNLOCK_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_COLOR_POOL = [
+  "#6d4aff",
   "#1f7a8c",
   "#8f2d56",
   "#2e4057",
@@ -19,15 +21,13 @@ const DEFAULT_COLOR_POOL = [
   "#3a5a40",
   "#6b2737",
   "#385f71",
-  "#5a189a",
 ];
 
 function buildIdentityId(): string {
   if (typeof globalThis.crypto?.randomUUID === "function") {
     return globalThis.crypto.randomUUID();
   }
-
-  return `id-${Math.random().toString(16).slice(2)}`;
+  return `id-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 export function createEmptyVaultState(): VaultState {
@@ -35,6 +35,7 @@ export function createEmptyVaultState(): VaultState {
     identities: [],
     activeIdentityId: null,
     unlockedSessions: {},
+    sessionKeys: {},
   };
 }
 
@@ -50,13 +51,12 @@ export class MemoryVaultStorage implements VaultStorage {
   }
 
   async save(state: VaultState): Promise<void> {
-    this.state = structuredClone(state);
-  }
-}
-
-export class DemoSignerAdapter implements SignerAdapter {
-  async signEvent(request: SignRequest): Promise<string> {
-    return hashHex(`${request.identityId}:${request.eventHash}`);
+    // Never save session keys to storage!
+    const stateToSave = {
+      ...state,
+      sessionKeys: {},
+    };
+    this.state = structuredClone(stateToSave);
   }
 }
 
@@ -67,7 +67,8 @@ export class IdentityVault {
   constructor(
     private readonly storage: VaultStorage,
     private readonly signer: SignerAdapter,
-    private readonly now: () => number = () => Date.now(),
+    private readonly crypto: CryptoAdapter,
+    private readonly now: () => number = () => Date.now()
   ) {}
 
   async listIdentities(): Promise<IdentityRecord[]> {
@@ -82,21 +83,36 @@ export class IdentityVault {
       return null;
     }
 
-    return this.state.identities.find((identity) => identity.id === this.state.activeIdentityId) ?? null;
+    return (
+      this.state.identities.find(
+        (identity) => identity.id === this.state.activeIdentityId
+      ) ?? null
+    );
   }
 
-  async addIdentity(input: NewIdentityInput): Promise<IdentityRecord> {
+  async createIdentity(
+    label: string,
+    password: string
+  ): Promise<{ identity: IdentityRecord; mnemonic?: string }> {
     await this.ensureLoaded();
+
+    // Generate new keypair
+    const privateKey = await this.signer.generatePrivateKey();
+    const pubkey = await this.signer.getPublicKey(privateKey);
+
+    // Encrypt private key with password
+    const encryptedPrivateKey = await this.crypto.encrypt(privateKey, password);
 
     const timestamp = this.now();
     const identity: IdentityRecord = {
       id: buildIdentityId(),
-      label: input.label,
-      pubkey: input.pubkey,
-      npub: input.npub,
-      color: input.color ?? this.pickColor(input.pubkey),
+      label,
+      pubkey,
+      npub: undefined, // TODO: convert to npub
+      color: this.pickColor(pubkey),
       createdAt: timestamp,
       lastUsedAt: timestamp,
+      encryptedPrivateKey,
     };
 
     this.state.identities.push(identity);
@@ -105,15 +121,55 @@ export class IdentityVault {
       this.state.activeIdentityId = identity.id;
     }
 
+    // Auto-unlock this identity
+    await this.unlockIdentity(identity.id, password);
+
     await this.persist();
+    return { identity };
+  }
+
+  async importIdentity(
+    label: string,
+    privateKey: string,
+    password: string
+  ): Promise<IdentityRecord> {
+    await this.ensureLoaded();
+
+    const pubkey = await this.signer.getPublicKey(privateKey);
+    const encryptedPrivateKey = await this.crypto.encrypt(privateKey, password);
+
+    const timestamp = this.now();
+    const identity: IdentityRecord = {
+      id: buildIdentityId(),
+      label,
+      pubkey,
+      npub: undefined,
+      color: this.pickColor(pubkey),
+      createdAt: timestamp,
+      lastUsedAt: timestamp,
+      encryptedPrivateKey,
+    };
+
+    this.state.identities.push(identity);
+
+    if (!this.state.activeIdentityId) {
+      this.state.activeIdentityId = identity.id;
+    }
+
+    await this.unlockIdentity(identity.id, password);
+    await this.persist();
+
     return identity;
   }
 
   async removeIdentity(identityId: string): Promise<void> {
     await this.ensureLoaded();
 
-    this.state.identities = this.state.identities.filter((identity) => identity.id !== identityId);
+    this.state.identities = this.state.identities.filter(
+      (identity) => identity.id !== identityId
+    );
     delete this.state.unlockedSessions[identityId];
+    delete this.state.sessionKeys?.[identityId];
 
     if (this.state.activeIdentityId === identityId) {
       this.state.activeIdentityId = this.state.identities[0]?.id ?? null;
@@ -125,7 +181,9 @@ export class IdentityVault {
   async setActiveIdentity(identityId: string): Promise<void> {
     await this.ensureLoaded();
 
-    const identity = this.state.identities.find((entry) => entry.id === identityId);
+    const identity = this.state.identities.find(
+      (entry) => entry.id === identityId
+    );
     if (!identity) {
       throw new Error("Identity not found");
     }
@@ -135,18 +193,44 @@ export class IdentityVault {
     await this.persist();
   }
 
-  async unlockIdentity(identityId: string, ttlMs: number = DEFAULT_UNLOCK_TTL_MS): Promise<void> {
+  async unlockIdentity(
+    identityId: string,
+    password: string,
+    ttlMs: number = DEFAULT_UNLOCK_TTL_MS
+  ): Promise<boolean> {
     await this.ensureLoaded();
-    this.assertIdentity(identityId);
 
+    const identity = this.state.identities.find((i) => i.id === identityId);
+    if (!identity || !identity.encryptedPrivateKey) {
+      return false;
+    }
+
+    // Try to decrypt the private key
+    const privateKey = await this.crypto.decrypt(
+      identity.encryptedPrivateKey,
+      password
+    );
+
+    if (!privateKey) {
+      return false;
+    }
+
+    // Store in session (memory only)
+    if (!this.state.sessionKeys) {
+      this.state.sessionKeys = {};
+    }
+    this.state.sessionKeys[identityId] = privateKey;
     this.state.unlockedSessions[identityId] = this.now() + ttlMs;
+
     await this.persist();
+    return true;
   }
 
   async lockIdentity(identityId: string): Promise<void> {
     await this.ensureLoaded();
 
     delete this.state.unlockedSessions[identityId];
+    delete this.state.sessionKeys?.[identityId];
     await this.persist();
   }
 
@@ -154,6 +238,7 @@ export class IdentityVault {
     await this.ensureLoaded();
 
     this.state.unlockedSessions = {};
+    this.state.sessionKeys = {};
     await this.persist();
   }
 
@@ -167,6 +252,7 @@ export class IdentityVault {
 
     if (expiry <= this.now()) {
       delete this.state.unlockedSessions[identityId];
+      delete this.state.sessionKeys?.[identityId];
       await this.persist();
       return false;
     }
@@ -180,7 +266,12 @@ export class IdentityVault {
     const identity = await this.resolveIdentity(input.identityId);
     const unlocked = await this.isUnlocked(identity.id);
     if (!unlocked) {
-      throw new Error(`Identity \"${identity.label}\" is locked`);
+      throw new Error(`Identity "${identity.label}" is locked`);
+    }
+
+    const privateKey = this.state.sessionKeys?.[identity.id];
+    if (!privateKey) {
+      throw new Error(`Private key not available for "${identity.label}"`);
     }
 
     const unsignedEvent = {
@@ -197,6 +288,7 @@ export class IdentityVault {
       pubkey: identity.pubkey,
       eventHash: id,
       serialized,
+      privateKey,
     });
 
     identity.lastUsedAt = this.now();
@@ -212,7 +304,11 @@ export class IdentityVault {
 
   async getSnapshot(): Promise<VaultState> {
     await this.ensureLoaded();
-    return structuredClone(this.state);
+    // Return without session keys for security
+    return {
+      ...this.state,
+      sessionKeys: {},
+    };
   }
 
   private async ensureLoaded(): Promise<void> {
@@ -222,6 +318,8 @@ export class IdentityVault {
 
     const existing = await this.storage.load();
     this.state = existing ?? createEmptyVaultState();
+    // Always clear session keys on load
+    this.state.sessionKeys = {};
     this.loaded = true;
   }
 
@@ -229,14 +327,18 @@ export class IdentityVault {
     await this.storage.save(this.state);
   }
 
-  private async resolveIdentity(identityId?: string): Promise<IdentityRecord> {
+  private async resolveIdentity(
+    identityId?: string
+  ): Promise<IdentityRecord> {
     const selected = identityId ?? this.state.activeIdentityId;
 
     if (!selected) {
       throw new Error("No active identity selected");
     }
 
-    const identity = this.state.identities.find((entry) => entry.id === selected);
+    const identity = this.state.identities.find(
+      (entry) => entry.id === selected
+    );
     if (!identity) {
       throw new Error("Identity not found");
     }
@@ -244,17 +346,10 @@ export class IdentityVault {
     return identity;
   }
 
-  private assertIdentity(identityId: string): void {
-    const exists = this.state.identities.some((entry) => entry.id === identityId);
-    if (!exists) {
-      throw new Error("Identity not found");
-    }
-  }
-
   private pickColor(pubkey: string): string {
     const normalized = pubkey.toLowerCase().replace(/[^0-9a-f]/g, "");
     if (!normalized) {
-      return DEFAULT_COLOR_POOL[0] ?? "#205d8f";
+      return DEFAULT_COLOR_POOL[0] ?? "#6d4aff";
     }
 
     const score = normalized
@@ -262,6 +357,6 @@ export class IdentityVault {
       .reduce((acc, chunk) => acc + Number.parseInt(chunk, 16), 0);
 
     const selected = DEFAULT_COLOR_POOL[score % DEFAULT_COLOR_POOL.length];
-    return selected ?? "#205d8f";
+    return selected ?? "#6d4aff";
   }
 }
