@@ -15,10 +15,9 @@ class ChromeVaultStorage implements VaultStorage {
       const result = await browser.storage.local.get(STORAGE_KEY);
       const stored = result[STORAGE_KEY];
       if (!stored) return null;
-      // Always clear session data on load
+      // Never keep masterKey in persisted storage.
       return {
         ...stored,
-        unlockedAt: null,
         masterKey: null,
       };
     } catch {
@@ -27,10 +26,9 @@ class ChromeVaultStorage implements VaultStorage {
   }
 
   async save(state: VaultState): Promise<void> {
-    // Never save session data
+    // Never save masterKey to storage.
     const safeState = {
       ...state,
-      unlockedAt: null,
       masterKey: null,
     };
     try {

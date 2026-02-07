@@ -25,6 +25,17 @@ export function npubToHex(npub: string): string {
   return bytesToHex(bytes);
 }
 
+export function hexToNsec(hex: string): string {
+  const data = bech32.toWords(hexToBytes(hex));
+  return bech32.encode("nsec", data, 1000);
+}
+
+export function nsecToHex(nsec: string): string {
+  const decoded = bech32.decode(nsec as `${string}1${string}`);
+  const bytes = bech32.fromWords(decoded.words);
+  return bytesToHex(bytes);
+}
+
 export function signEvent(privateKeyHex: string, eventHash: string): string {
   const sig = schnorr.sign(eventHash, hexToBytes(privateKeyHex));
   return bytesToHex(sig);

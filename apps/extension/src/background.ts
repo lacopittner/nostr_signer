@@ -37,7 +37,7 @@ browser.runtime.onMessage.addListener(async (message, sender) => {
         if (!identity) {
           return { error: "No active identity" };
         }
-        return { pubkey: identity.pubkey };
+        return identity.pubkey;
       } catch (err) {
         return { error: err instanceof Error ? err.message : "Unknown error" };
       }

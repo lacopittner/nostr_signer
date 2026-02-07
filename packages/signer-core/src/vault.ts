@@ -174,8 +174,13 @@ export class IdentityVault {
   async importIdentity(label: string, privateKey: string): Promise<IdentityRecord> {
     await this.ensureUnlocked();
 
-    const pubkey = await this.signer.getPublicKey(privateKey);
-    const encryptedKey = await this.encryptWithMasterKey(privateKey);
+    const { nsecToHex } = await import("./nostr");
+    const normalizedPrivateKey = privateKey.trim().startsWith("nsec1")
+      ? nsecToHex(privateKey.trim())
+      : privateKey.trim();
+
+    const pubkey = await this.signer.getPublicKey(normalizedPrivateKey);
+    const encryptedKey = await this.encryptWithMasterKey(normalizedPrivateKey);
 
     const identity: IdentityRecord = {
       id: buildIdentityId(),
@@ -229,6 +234,21 @@ export class IdentityVault {
     this.state.activeIdentityId = id;
     identity.lastUsedAt = this.now();
     await this.persist();
+  }
+
+  // === Export Private Key ===
+
+  async exportPrivateKey(identityId: string): Promise<string> {
+    await this.ensureUnlocked();
+
+    const identity = this.state.identities.find(i => i.id === identityId);
+    if (!identity) throw new Error("Identity not found");
+    if (!identity.encryptedPrivateKey) throw new Error("Private key not available");
+
+    const privateKey = await this.decryptWithMasterKey(identity.encryptedPrivateKey);
+    if (!privateKey) throw new Error("Failed to decrypt private key");
+
+    return privateKey;
   }
 
   // === Signing ===

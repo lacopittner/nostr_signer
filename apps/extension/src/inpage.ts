@@ -1,6 +1,8 @@
 // Inpage script - injected into page context
 // Exposes window.nostr API for NIP-07 compatibility
 
+console.log("[Nostr Signer] Inpage script executing");
+
 interface NostrEvent {
   id?: string;
   pubkey?: string;
@@ -14,9 +16,11 @@ interface NostrEvent {
 (() => {
   // Prevent double injection
   if ((window as any).nostr) {
-    console.log("[Nostr Signer] Already injected");
+    console.log("[Nostr Signer] Already injected, skipping");
     return;
   }
+
+  console.log("[Nostr Signer] Injecting NIP-07 API...");
 
   let requestId = 0;
   const pendingRequests = new Map<

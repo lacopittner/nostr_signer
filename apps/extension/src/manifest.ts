@@ -19,14 +19,14 @@ const manifest: CrossBrowserManifest = {
     {
       matches: ["<all_urls>"],
       js: ["src/content.ts"],
-      run_at: "document_start",
-      world: "MAIN",
+      run_at: "document_start"
     },
   ],
   web_accessible_resources: [
     {
       resources: ["src/inpage.ts"],
       matches: ["<all_urls>"],
+      use_dynamic_url: true,
     },
   ],
   browser_specific_settings: {
