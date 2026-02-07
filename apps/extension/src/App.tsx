@@ -7,6 +7,7 @@ type ThemeMode = "light" | "dark";
 const THEME_STORAGE_KEY = "nostr_signer_theme";
 const REMEMBER_UNLOCK_KEY = "nostr_signer_remember_unlock";
 const SESSION_UNLOCK_KEY = "nostr_signer_session_unlock";
+const LOCKED_STATE_KEY = "nostr_signer_locked";
 const DEFAULT_PROFILE_KEY = "nostr_signer_default_profile_id";
 const DEFAULT_UNLOCK_TTL_MS = 15 * 60 * 1000;
 const SESSION_UNLOCK_TTL_MS = 365 * 24 * 60 * 60 * 1000;
@@ -22,6 +23,7 @@ interface TrustedCapability {
 
 interface TrustedWebsiteEntry {
   origin: string;
+  getPublicKeyPolicy: TrustedSignPolicyMode;
   signPolicy: TrustedSignPolicyMode;
   policyIdentityId: string | null;
   boundProfileId: string | null;
@@ -30,8 +32,9 @@ interface TrustedWebsiteEntry {
 
 interface PendingRequestState {
   id: string;
+  type: "sign_event" | "get_public_key";
   origin: string;
-  event: any;
+  event: any | null;
   selectedIdentityId: string | null;
   autoApprove: boolean;
 }
@@ -70,6 +73,7 @@ function describeEventKind(kind: unknown): string {
 // Sign Request Confirmation Screen
 function SignRequestScreen({
   requestId,
+  requestType,
   origin,
   event,
   identities,
@@ -79,8 +83,9 @@ function SignRequestScreen({
   onComplete,
 }: {
   requestId: string;
+  requestType: "sign_event" | "get_public_key";
   origin: string;
-  event: any;
+  event: any | null;
   identities: IdentityRecord[];
   defaultProfileId: string | null;
   initialProfileId: string | null;
@@ -167,15 +172,26 @@ function SignRequestScreen({
 
   return (
     <div style={{ padding: "20px", width: "500px", maxWidth: "100%" }}>
-      <h2 style={{ marginBottom: "8px" }}>{autoApprove ? "Signing Request" : "Sign Request"}</h2>
+      <h2 style={{ marginBottom: "8px" }}>
+        {requestType === "get_public_key"
+          ? autoApprove
+            ? "Access Request"
+            : "Public Key Request"
+          : autoApprove
+            ? "Signing Request"
+            : "Sign Request"}
+      </h2>
       <p style={{ color: "var(--text-muted)", marginBottom: "20px", fontSize: "14px" }}>
         {autoApprove ? (
           <>
-            <strong>{origin}</strong> is allowed by policy. Signing after unlock.
+            <strong>{origin}</strong> is allowed by policy. Continuing after unlock.
           </>
         ) : (
           <>
-            <strong>{origin}</strong> wants to sign a Nostr event
+            <strong>{origin}</strong>{" "}
+            {requestType === "get_public_key"
+              ? "wants to access your public key"
+              : "wants to sign a Nostr event"}
           </>
         )}
       </p>
@@ -205,40 +221,42 @@ function SignRequestScreen({
         </select>
       </div>
 
-      <div
-        style={{
-          background: "var(--surface-muted)",
-          padding: "12px",
-          borderRadius: "8px",
-          marginBottom: "20px",
-          fontSize: "13px",
-        }}
-      >
-        <div style={{ marginBottom: "8px" }}>
-          <strong>Kind:</strong> {event.kind} - {describeEventKind(event.kind)}
-        </div>
-        <div style={{ marginBottom: "8px" }}>
-          <strong>Content:</strong>
-          <div
-            style={{
-              marginTop: "4px",
-              padding: "8px",
-              background: "var(--surface-elevated)",
-              borderRadius: "4px",
-              wordBreak: "break-word",
-              maxHeight: "100px",
-              overflow: "auto",
-            }}
-          >
-            {event.content}
+      {requestType === "sign_event" && event && (
+        <div
+          style={{
+            background: "var(--surface-muted)",
+            padding: "12px",
+            borderRadius: "8px",
+            marginBottom: "20px",
+            fontSize: "13px",
+          }}
+        >
+          <div style={{ marginBottom: "8px" }}>
+            <strong>Kind:</strong> {event.kind} - {describeEventKind(event.kind)}
           </div>
-        </div>
-        {event.tags?.length > 0 && (
-          <div>
-            <strong>Tags:</strong> {event.tags.length}
+          <div style={{ marginBottom: "8px" }}>
+            <strong>Content:</strong>
+            <div
+              style={{
+                marginTop: "4px",
+                padding: "8px",
+                background: "var(--surface-elevated)",
+                borderRadius: "4px",
+                wordBreak: "break-word",
+                maxHeight: "100px",
+                overflow: "auto",
+              }}
+            >
+              {event.content}
+            </div>
           </div>
-        )}
-      </div>
+          {event.tags?.length > 0 && (
+            <div>
+              <strong>Tags:</strong> {event.tags.length}
+            </div>
+          )}
+        </div>
+      )}
 
       {error && <p style={{ color: "var(--danger)", marginBottom: "12px", fontSize: "13px" }}>{error}</p>}
 
@@ -621,7 +639,7 @@ export default function App() {
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
   const [trustedSites, setTrustedSites] = useState<TrustedWebsiteEntry[]>([]);
   const [trustedSiteDrafts, setTrustedSiteDrafts] = useState<
-    Record<string, { signPolicy: TrustedSignPolicyMode; boundProfileId: string }>
+    Record<string, { getPublicKeyPolicy: TrustedSignPolicyMode; signPolicy: TrustedSignPolicyMode; boundProfileId: string }>
   >({});
   const [trustedSitesLoading, setTrustedSitesLoading] = useState(false);
   
@@ -644,12 +662,15 @@ export default function App() {
     const request = raw as Record<string, unknown>;
     if (typeof request.id !== "string" || !request.id) return null;
     if (typeof request.origin !== "string" || !request.origin) return null;
-    if (!("event" in request)) return null;
+    const type =
+      request.type === "get_public_key" || request.type === "sign_event" ? request.type : "sign_event";
+    const event = "event" in request ? request.event : null;
 
     return {
       id: request.id,
+      type,
       origin: request.origin,
-      event: request.event,
+      event,
       selectedIdentityId: typeof request.selectedIdentityId === "string" ? request.selectedIdentityId : null,
       autoApprove: Boolean(request.autoApprove),
     };
@@ -678,11 +699,20 @@ export default function App() {
               entry?.signPolicy === "always_allow" || entry?.signPolicy === "always_reject"
                 ? entry.signPolicy
                 : "ask";
+            const getPublicKeyPolicy: TrustedSignPolicyMode =
+              entry?.getPublicKeyPolicy === "always_allow" || entry?.getPublicKeyPolicy === "always_reject"
+                ? entry.getPublicKeyPolicy
+                : "ask";
             const capabilityFallback: TrustedCapability[] = [
               {
                 key: "get_public_key",
                 label: "Get public key",
-                state: "allow",
+                state:
+                  getPublicKeyPolicy === "always_allow"
+                    ? "allow"
+                    : getPublicKeyPolicy === "always_reject"
+                      ? "deny"
+                      : "ask",
               },
               {
                 key: "sign_event",
@@ -726,6 +756,7 @@ export default function App() {
 
             return {
               origin: String(entry?.origin ?? ""),
+              getPublicKeyPolicy,
               signPolicy,
               policyIdentityId: typeof entry?.policyIdentityId === "string" ? entry.policyIdentityId : null,
               boundProfileId: typeof entry?.boundProfileId === "string" ? entry.boundProfileId : null,
@@ -735,9 +766,13 @@ export default function App() {
         : [];
       setTrustedSites(entries);
 
-      const nextDrafts: Record<string, { signPolicy: TrustedSignPolicyMode; boundProfileId: string }> = {};
+      const nextDrafts: Record<
+        string,
+        { getPublicKeyPolicy: TrustedSignPolicyMode; signPolicy: TrustedSignPolicyMode; boundProfileId: string }
+      > = {};
       entries.forEach((entry) => {
         nextDrafts[entry.origin] = {
+          getPublicKeyPolicy: entry.getPublicKeyPolicy,
           signPolicy: entry.signPolicy,
           boundProfileId: entry.boundProfileId ?? "",
         };
@@ -784,10 +819,12 @@ export default function App() {
   useEffect(() => {
     const init = async () => {
       let rememberPref = true;
+      let forcedLocked = false;
       try {
         const result = await browser.storage.local.get([
           THEME_STORAGE_KEY,
           REMEMBER_UNLOCK_KEY,
+          LOCKED_STATE_KEY,
           DEFAULT_PROFILE_KEY,
         ]);
         const storedTheme = result[THEME_STORAGE_KEY];
@@ -797,6 +834,9 @@ export default function App() {
         if (typeof result[REMEMBER_UNLOCK_KEY] === "boolean") {
           rememberPref = result[REMEMBER_UNLOCK_KEY];
         }
+        if (result[LOCKED_STATE_KEY] === true) {
+          forcedLocked = true;
+        }
         if (typeof result[DEFAULT_PROFILE_KEY] === "string") {
           setDefaultProfileId(result[DEFAULT_PROFILE_KEY]);
         }
@@ -805,15 +845,15 @@ export default function App() {
         // Ignore preference loading errors
       }
 
-      await refreshPendingRequest();
+      try {
+        await refreshPendingRequest();
 
-      const pinSet = await vault.isPinSet();
-      setHasPin(pinSet);
-      
-      if (pinSet) {
-        let unlocked = await vault.isUnlocked();
-        if (unlocked) {
-          if (!rememberPref) {
+        const pinSet = await vault.isPinSet();
+        setHasPin(pinSet);
+        
+        if (pinSet) {
+          let unlocked = await vault.isUnlocked();
+          if (forcedLocked && unlocked) {
             await vault.lock();
             try {
               await browser.runtime.sendMessage({ type: "LOCK_VAULT" });
@@ -821,11 +861,29 @@ export default function App() {
               // ignore background sync errors
             }
             unlocked = false;
-          } else {
-            try {
-              const session = await browser.storage.session.get(SESSION_UNLOCK_KEY);
-              const sessionAllowed = Boolean(session[SESSION_UNLOCK_KEY]);
-              if (!sessionAllowed) {
+          } else if (unlocked) {
+            if (!rememberPref) {
+              await vault.lock();
+              try {
+                await browser.runtime.sendMessage({ type: "LOCK_VAULT" });
+              } catch {
+                // ignore background sync errors
+              }
+              unlocked = false;
+            } else {
+              try {
+                const session = await browser.storage.session.get(SESSION_UNLOCK_KEY);
+                const sessionAllowed = Boolean(session[SESSION_UNLOCK_KEY]);
+                if (!sessionAllowed) {
+                  await vault.lock();
+                  try {
+                    await browser.runtime.sendMessage({ type: "LOCK_VAULT" });
+                  } catch {
+                    // ignore background sync errors
+                  }
+                  unlocked = false;
+                }
+              } catch {
                 await vault.lock();
                 try {
                   await browser.runtime.sendMessage({ type: "LOCK_VAULT" });
@@ -834,27 +892,28 @@ export default function App() {
                 }
                 unlocked = false;
               }
-            } catch {
-              await vault.lock();
-              try {
-                await browser.runtime.sendMessage({ type: "LOCK_VAULT" });
-              } catch {
-                // ignore background sync errors
-              }
-              unlocked = false;
             }
           }
-        }
 
-        setIsLocked(!unlocked);
-        await refresh();
-        await refreshTrustedSites();
+          try {
+            await browser.storage.local.set({ [LOCKED_STATE_KEY]: !unlocked });
+          } catch {
+            // Ignore lock-state save errors
+          }
+
+          setIsLocked(!unlocked);
+          await refresh();
+          await refreshTrustedSites();
+        }
+      } catch (error) {
+        console.error("[Nostr Signer] Vault init failed:", error);
+        showToast("Vault storage read failed. Reload extension.", "error");
       }
       
       setIsLoading(false);
     };
     void init();
-  }, [refresh, refreshPendingRequest, refreshTrustedSites]);
+  }, [refresh, refreshPendingRequest, refreshTrustedSites, showToast]);
 
   useEffect(() => {
     const handleRuntimeMessage = (message: unknown) => {
@@ -897,7 +956,10 @@ export default function App() {
 
     setRememberUnlock(remember);
     try {
-      await browser.storage.local.set({ [REMEMBER_UNLOCK_KEY]: remember });
+      await browser.storage.local.set({
+        [REMEMBER_UNLOCK_KEY]: remember,
+        [LOCKED_STATE_KEY]: false,
+      });
       if (remember) {
         await browser.storage.session.set({ [SESSION_UNLOCK_KEY]: true });
       } else {
@@ -938,7 +1000,10 @@ export default function App() {
 
     setRememberUnlock(remember);
     try {
-      await browser.storage.local.set({ [REMEMBER_UNLOCK_KEY]: remember });
+      await browser.storage.local.set({
+        [REMEMBER_UNLOCK_KEY]: remember,
+        [LOCKED_STATE_KEY]: false,
+      });
       if (remember) {
         await browser.storage.session.set({ [SESSION_UNLOCK_KEY]: true });
       } else {
@@ -962,6 +1027,7 @@ export default function App() {
       // Ignore background sync errors
     }
     try {
+      await browser.storage.local.set({ [LOCKED_STATE_KEY]: true });
       await browser.storage.session.remove(SESSION_UNLOCK_KEY);
     } catch {
       // Ignore session cleanup errors
@@ -1069,10 +1135,10 @@ export default function App() {
   const updateTrustedSiteDraft = useCallback(
     (
       origin: string,
-      updates: Partial<{ signPolicy: TrustedSignPolicyMode; boundProfileId: string }>
+      updates: Partial<{ getPublicKeyPolicy: TrustedSignPolicyMode; signPolicy: TrustedSignPolicyMode; boundProfileId: string }>
     ) => {
       setTrustedSiteDrafts((prev) => {
-        const current = prev[origin] ?? { signPolicy: "ask", boundProfileId: "" };
+        const current = prev[origin] ?? { getPublicKeyPolicy: "ask", signPolicy: "ask", boundProfileId: "" };
         return {
           ...prev,
           [origin]: {
@@ -1096,17 +1162,19 @@ export default function App() {
 
       const payload: {
         origin: string;
+        getPublicKeyPolicy: TrustedSignPolicyMode;
         signPolicy: TrustedSignPolicyMode;
         policyIdentityId: string | null;
         boundProfileId: string | null;
       } = {
         origin,
+        getPublicKeyPolicy: draft.getPublicKeyPolicy,
         signPolicy: draft.signPolicy,
         boundProfileId: draft.boundProfileId || null,
         policyIdentityId: null,
       };
 
-      if (payload.signPolicy === "always_allow") {
+      if (payload.signPolicy === "always_allow" || payload.getPublicKeyPolicy === "always_allow") {
         payload.policyIdentityId = payload.boundProfileId || resolveDefaultProfileForPolicy() || null;
       }
 
@@ -1207,6 +1275,7 @@ export default function App() {
     return (
       <SignRequestScreen
         requestId={pendingRequest.id}
+        requestType={pendingRequest.type}
         origin={pendingRequest.origin}
         event={pendingRequest.event}
         identities={identities}
@@ -1494,9 +1563,22 @@ export default function App() {
           <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
             {trustedSites.map((site) => {
               const draft = trustedSiteDrafts[site.origin] ?? {
+                getPublicKeyPolicy: site.getPublicKeyPolicy,
                 signPolicy: site.signPolicy,
                 boundProfileId: site.boundProfileId ?? "",
               };
+              const publicKeyStatusLabel =
+                draft.getPublicKeyPolicy === "always_allow"
+                  ? "Always allow"
+                  : draft.getPublicKeyPolicy === "always_reject"
+                    ? "Always reject"
+                    : "Ask every time";
+              const publicKeyStatusColor =
+                draft.getPublicKeyPolicy === "always_allow"
+                  ? "var(--active-text)"
+                  : draft.getPublicKeyPolicy === "always_reject"
+                    ? "var(--danger)"
+                    : "var(--text-muted)";
               const signingStatusLabel =
                 draft.signPolicy === "always_allow"
                   ? "Always allow"
@@ -1559,7 +1641,7 @@ export default function App() {
                     }}
                   >
                     <span style={{ color: "var(--text-muted)" }}>Public key:</span>
-                    <span style={{ color: "var(--active-text)" }}>Always allowed</span>
+                    <span style={{ color: publicKeyStatusColor }}>{publicKeyStatusLabel}</span>
                     <span style={{ color: "var(--text-muted)" }}>Sign events:</span>
                     <span style={{ color: signingStatusColor }}>{signingStatusLabel}</span>
                     <span style={{ color: "var(--text-muted)" }}>Site profile:</span>
@@ -1567,6 +1649,31 @@ export default function App() {
                   </div>
 
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
+                    <label style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+                      Public key access
+                      <select
+                        value={draft.getPublicKeyPolicy}
+                        onChange={(e) =>
+                          updateTrustedSiteDraft(site.origin, {
+                            getPublicKeyPolicy: e.target.value as TrustedSignPolicyMode,
+                          })
+                        }
+                        style={{
+                          width: "100%",
+                          marginTop: "4px",
+                          padding: "8px",
+                          borderRadius: "6px",
+                          border: "1px solid var(--border-muted)",
+                          background: "var(--surface-elevated)",
+                          color: "var(--text-primary)",
+                        }}
+                      >
+                        <option value="ask">Ask every time</option>
+                        <option value="always_allow">Always allow</option>
+                        <option value="always_reject">Always reject</option>
+                      </select>
+                    </label>
+
                     <label style={{ fontSize: "12px", color: "var(--text-muted)", gridColumn: "1 / span 2" }}>
                       Sign events
                       <select

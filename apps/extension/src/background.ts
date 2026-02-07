@@ -5,11 +5,12 @@ import { vault } from "./lib/vault";
 const DEFAULT_PROFILE_KEY = "nostr_signer_default_profile_id";
 const ORIGIN_PROFILE_MAP_KEY = "nostr_signer_origin_profile_map";
 const SIGN_POLICY_MAP_KEY = "nostr_signer_sign_policy_map";
+const PUBLIC_KEY_POLICY_MAP_KEY = "nostr_signer_public_key_policy_map";
 const REMEMBER_UNLOCK_KEY = "nostr_signer_remember_unlock";
 const SESSION_UNLOCK_KEY = "nostr_signer_session_unlock";
+const LOCKED_STATE_KEY = "nostr_signer_locked";
 const APPROVAL_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
-const APPROVAL_WINDOW_WIDTH = 520;
-const APPROVAL_WINDOW_HEIGHT = 760;
+const PUBLIC_KEY_ALLOW_BURST_MS = 15_000;
 
 const DEFAULT_RELAYS: Record<string, { read: boolean; write: boolean }> = {
   "wss://relay.damus.io": { read: true, write: true },
@@ -25,6 +26,7 @@ interface SignPolicy {
 }
 
 type SignPolicyMap = Record<string, SignPolicy>;
+type PublicKeyPolicyMap = Record<string, SignPolicy>;
 type OriginProfileMap = Record<string, string>;
 
 type TrustedSignPolicyMode = "ask" | SignPolicyMode;
@@ -38,6 +40,7 @@ interface TrustedCapability {
 
 interface TrustedWebsiteEntry {
   origin: string;
+  getPublicKeyPolicy: TrustedSignPolicyMode;
   signPolicy: TrustedSignPolicyMode;
   policyIdentityId: string | null;
   boundProfileId: string | null;
@@ -51,37 +54,39 @@ interface SignEventPayload {
   created_at?: number;
 }
 
-interface PendingSignRequest {
+type PendingRequestType = "sign_event" | "get_public_key";
+
+interface PendingRequest {
   id: string;
+  type: PendingRequestType;
   origin: string;
-  payload: SignEventPayload;
+  payload: SignEventPayload | null;
   selectedIdentityId: string | null;
   autoApprove: boolean;
-  resolve: (value: SignedNostrEvent) => void;
+  resolve: (value: SignedNostrEvent | string) => void;
   reject: (reason: Error) => void;
   timestamp: number;
 }
 
 interface PopupPendingRequest {
   id: string;
+  type: PendingRequestType;
   origin: string;
-  event: SignEventPayload;
+  event: SignEventPayload | null;
   selectedIdentityId: string | null;
   autoApprove: boolean;
 }
 
-const pendingRequests = new Map<string, PendingSignRequest>();
-let approvalWindowId: number | null = null;
+const pendingRequests = new Map<string, PendingRequest>();
+const pendingPublicKeyJoiners = new Map<
+  string,
+  Array<{ resolve: (value: string) => void; reject: (reason: Error) => void }>
+>();
+const recentPublicKeyApprovals = new Map<string, number>();
 let approvalSurfaceOpening: Promise<boolean> | null = null;
 
 browser.runtime.onInstalled.addListener(() => {
   console.info("Nostr Signer installed");
-});
-
-browser.windows.onRemoved.addListener((windowId: number) => {
-  if (windowId === approvalWindowId) {
-    approvalWindowId = null;
-  }
 });
 
 setInterval(() => {
@@ -89,7 +94,9 @@ setInterval(() => {
   let removedAny = false;
   for (const [requestId, request] of pendingRequests) {
     if (now - request.timestamp > APPROVAL_REQUEST_TIMEOUT_MS) {
-      request.reject(new Error("Request timeout"));
+      const timeoutError = new Error("Request timeout");
+      request.reject(timeoutError);
+      rejectPublicKeyJoiners(requestId, timeoutError);
       pendingRequests.delete(requestId);
       removedAny = true;
     }
@@ -115,11 +122,51 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
           return { error: "No identity available" };
         }
 
-        if (requestOrigin !== "unknown") {
-          await bindOriginProfile(requestOrigin, identity.id);
+        const publicKeyPolicies = await loadPublicKeyPolicies();
+        const policy = publicKeyPolicies[requestOrigin];
+        if (policy?.mode === "always_reject") {
+          return { error: "Rejected by policy" };
         }
 
-        return identity.pubkey;
+        const selectedIdentity = (await resolveIdentityById(policy?.identityId ?? null)) ?? identity;
+        const unlocked = await vault.isUnlocked();
+        const approvalBurstUntil = recentPublicKeyApprovals.get(requestOrigin) ?? 0;
+        if (approvalBurstUntil <= Date.now()) {
+          recentPublicKeyApprovals.delete(requestOrigin);
+        }
+
+        if (policy?.mode === "always_allow") {
+          if (unlocked) {
+            if (requestOrigin !== "unknown") {
+              await bindOriginProfile(requestOrigin, selectedIdentity.id);
+            }
+            return selectedIdentity.pubkey;
+          }
+
+          await showNotification("Nostr Signer", `${requestOrigin} requests access. Unlock to continue.`);
+          return await queuePendingPublicKeyRequest({
+            origin: requestOrigin,
+            selectedIdentityId: selectedIdentity.id,
+            autoApprove: true,
+          });
+        }
+
+        if (unlocked && (recentPublicKeyApprovals.get(requestOrigin) ?? 0) > Date.now()) {
+          if (requestOrigin !== "unknown") {
+            await bindOriginProfile(requestOrigin, selectedIdentity.id);
+          }
+          return selectedIdentity.pubkey;
+        }
+
+        if (!unlocked) {
+          await showNotification("Nostr Signer", `${requestOrigin} requests access. Unlock to continue.`);
+        }
+
+        return await queuePendingPublicKeyRequest({
+          origin: requestOrigin,
+          selectedIdentityId: selectedIdentity.id,
+          autoApprove: false,
+        });
       } catch (error) {
         return { error: toErrorMessage(error, "Failed to get public key") };
       }
@@ -204,21 +251,39 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
     }
 
     case "UNLOCK_VAULT": {
-      const pin = asString(data.pin);
-      const ttlMs = asFiniteNumber(data.ttlMs);
-      if (!pin) {
-        return { error: "PIN is required" };
+      try {
+        const pin = asString(data.pin);
+        const ttlMs = asFiniteNumber(data.ttlMs);
+        if (!pin) {
+          return { error: "PIN is required" };
+        }
+        const unlocked = await vault.unlock(pin, ttlMs ?? undefined);
+        if (!unlocked) {
+          return { error: "Invalid PIN" };
+        }
+        try {
+          await browser.storage.local.set({ [LOCKED_STATE_KEY]: false });
+        } catch {
+          // Ignore lock-state sync errors.
+        }
+        return { success: true };
+      } catch (error) {
+        return { error: toErrorMessage(error, "Failed to unlock vault") };
       }
-      const unlocked = await vault.unlock(pin, ttlMs ?? undefined);
-      if (!unlocked) {
-        return { error: "Invalid PIN" };
-      }
-      return { success: true };
     }
 
     case "LOCK_VAULT": {
-      await vault.lock();
-      return { success: true };
+      try {
+        await vault.lock();
+        try {
+          await browser.storage.local.set({ [LOCKED_STATE_KEY]: true });
+        } catch {
+          // Ignore lock-state sync errors.
+        }
+        return { success: true };
+      } catch (error) {
+        return { error: toErrorMessage(error, "Failed to lock vault") };
+      }
     }
 
     case "GET_TRUSTED_WEBSITES": {
@@ -233,6 +298,11 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
         return { error: "Invalid origin" };
       }
 
+      const getPublicKeyPolicyRaw = asString(payload.getPublicKeyPolicy);
+      const getPublicKeyPolicy: TrustedSignPolicyMode =
+        getPublicKeyPolicyRaw === "always_allow" || getPublicKeyPolicyRaw === "always_reject"
+          ? getPublicKeyPolicyRaw
+          : "ask";
       const signPolicyRaw = asString(payload.signPolicy);
       const signPolicy: TrustedSignPolicyMode =
         signPolicyRaw === "always_allow" || signPolicyRaw === "always_reject" ? signPolicyRaw : "ask";
@@ -241,6 +311,7 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
       const requestedBoundProfileId = asString(payload.boundProfileId) || null;
 
       const signPolicies = await loadSignPolicies();
+      const publicKeyPolicies = await loadPublicKeyPolicies();
       const originProfiles = await loadOriginProfiles();
 
       if (signPolicy === "always_allow") {
@@ -258,6 +329,21 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
         delete signPolicies[requestOrigin];
       }
 
+      if (getPublicKeyPolicy === "always_allow") {
+        const resolvedIdentityId = await resolveApprovedIdentityId(
+          requestedPolicyIdentityId,
+          requestedBoundProfileId ?? originProfiles[requestOrigin] ?? null
+        );
+        if (!resolvedIdentityId) {
+          return { error: "No profile available for always allow" };
+        }
+        publicKeyPolicies[requestOrigin] = { mode: "always_allow", identityId: resolvedIdentityId };
+      } else if (getPublicKeyPolicy === "always_reject") {
+        publicKeyPolicies[requestOrigin] = { mode: "always_reject" };
+      } else {
+        delete publicKeyPolicies[requestOrigin];
+      }
+
       if (requestedBoundProfileId) {
         const existingIdentity = await resolveIdentityById(requestedBoundProfileId);
         if (!existingIdentity) {
@@ -269,6 +355,7 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
       }
 
       await saveSignPolicies(signPolicies);
+      await savePublicKeyPolicies(publicKeyPolicies);
       await saveOriginProfiles(originProfiles);
 
       const entries = await buildTrustedWebsiteEntries();
@@ -283,12 +370,15 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
       }
 
       const signPolicies = await loadSignPolicies();
+      const publicKeyPolicies = await loadPublicKeyPolicies();
       const originProfiles = await loadOriginProfiles();
 
       delete signPolicies[requestOrigin];
+      delete publicKeyPolicies[requestOrigin];
       delete originProfiles[requestOrigin];
 
       await saveSignPolicies(signPolicies);
+      await savePublicKeyPolicies(publicKeyPolicies);
       await saveOriginProfiles(originProfiles);
 
       const entries = await buildTrustedWebsiteEntries();
@@ -323,17 +413,18 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
   }
 });
 
-function getLatestPendingRequest(): PendingSignRequest | null {
+function getLatestPendingRequest(): PendingRequest | null {
   for (const request of pendingRequests.values()) {
     return request;
   }
   return null;
 }
 
-function toPopupPendingRequest(request: PendingSignRequest | null): PopupPendingRequest | null {
+function toPopupPendingRequest(request: PendingRequest | null): PopupPendingRequest | null {
   if (!request) return null;
   return {
     id: request.id,
+    type: request.type,
     origin: request.origin,
     event: request.payload,
     selectedIdentityId: request.selectedIdentityId,
@@ -343,6 +434,33 @@ function toPopupPendingRequest(request: PendingSignRequest | null): PopupPending
 
 function getLatestPopupPendingRequest(): PopupPendingRequest | null {
   return toPopupPendingRequest(getLatestPendingRequest());
+}
+
+function findPendingPublicKeyRequest(origin: string): PendingRequest | null {
+  for (const request of pendingRequests.values()) {
+    if (request.type === "get_public_key" && request.origin === origin) {
+      return request;
+    }
+  }
+  return null;
+}
+
+function resolvePublicKeyJoiners(requestId: string, pubkey: string) {
+  const joiners = pendingPublicKeyJoiners.get(requestId);
+  if (!joiners?.length) return;
+  pendingPublicKeyJoiners.delete(requestId);
+  for (const joiner of joiners) {
+    joiner.resolve(pubkey);
+  }
+}
+
+function rejectPublicKeyJoiners(requestId: string, reason: Error) {
+  const joiners = pendingPublicKeyJoiners.get(requestId);
+  if (!joiners?.length) return;
+  pendingPublicKeyJoiners.delete(requestId);
+  for (const joiner of joiners) {
+    joiner.reject(reason);
+  }
 }
 
 async function queuePendingSignRequest(params: {
@@ -356,8 +474,43 @@ async function queuePendingSignRequest(params: {
   return new Promise<SignedNostrEvent>((resolve, reject) => {
     pendingRequests.set(requestId, {
       id: requestId,
+      type: "sign_event",
       origin: params.origin,
       payload: params.payload,
+      selectedIdentityId: params.selectedIdentityId,
+      autoApprove: params.autoApprove,
+      resolve,
+      reject,
+      timestamp: Date.now(),
+    });
+
+    const shouldOpenSurface = pendingRequests.size === 1;
+    void onPendingRequestsChanged(shouldOpenSurface);
+  });
+}
+
+async function queuePendingPublicKeyRequest(params: {
+  origin: string;
+  selectedIdentityId: string | null;
+  autoApprove: boolean;
+}): Promise<string> {
+  const existing = findPendingPublicKeyRequest(params.origin);
+  if (existing) {
+    return new Promise<string>((resolve, reject) => {
+      const joiners = pendingPublicKeyJoiners.get(existing.id) ?? [];
+      joiners.push({ resolve, reject });
+      pendingPublicKeyJoiners.set(existing.id, joiners);
+    });
+  }
+
+  const requestId = crypto.randomUUID();
+
+  return new Promise<string>((resolve, reject) => {
+    pendingRequests.set(requestId, {
+      id: requestId,
+      type: "get_public_key",
+      origin: params.origin,
+      payload: null,
       selectedIdentityId: params.selectedIdentityId,
       autoApprove: params.autoApprove,
       resolve,
@@ -382,20 +535,45 @@ async function approvePendingRequest(requestId: string, requestedIdentityId: str
       throw new Error("No profile selected");
     }
 
-    const signed = await signEventWithIdentity(request.payload, identityId);
-
-    if (request.origin !== "unknown") {
-      await bindOriginProfile(request.origin, identityId);
-      if (alwaysAllow) {
-        await saveSignPolicy(request.origin, { mode: "always_allow", identityId });
+    if (request.type === "get_public_key") {
+      const identity = await resolveIdentityById(identityId);
+      if (!identity) {
+        throw new Error("No profile selected");
       }
-    }
 
-    request.resolve(signed);
+      if (request.origin !== "unknown") {
+        await bindOriginProfile(request.origin, identity.id);
+        if (alwaysAllow) {
+          await savePublicKeyPolicy(request.origin, { mode: "always_allow", identityId: identity.id });
+        }
+      }
+
+      request.resolve(identity.pubkey);
+      resolvePublicKeyJoiners(request.id, identity.pubkey);
+      if (!alwaysAllow && request.origin !== "unknown") {
+        recentPublicKeyApprovals.set(request.origin, Date.now() + PUBLIC_KEY_ALLOW_BURST_MS);
+      }
+    } else {
+      if (!request.payload) {
+        throw new Error("Invalid signing request");
+      }
+
+      const signed = await signEventWithIdentity(request.payload, identityId);
+
+      if (request.origin !== "unknown") {
+        await bindOriginProfile(request.origin, identityId);
+        if (alwaysAllow) {
+          await saveSignPolicy(request.origin, { mode: "always_allow", identityId });
+        }
+      }
+
+      request.resolve(signed);
+    }
     return { success: true };
   } catch (error) {
     const normalized = toError(error, "Signing failed");
     request.reject(normalized);
+    rejectPublicKeyJoiners(request.id, normalized);
     return { error: normalized.message };
   } finally {
     pendingRequests.delete(requestId);
@@ -410,10 +588,16 @@ async function rejectPendingRequest(requestId: string, alwaysReject: boolean) {
   }
 
   if (alwaysReject && request.origin !== "unknown") {
-    await saveSignPolicy(request.origin, { mode: "always_reject" });
+    if (request.type === "get_public_key") {
+      await savePublicKeyPolicy(request.origin, { mode: "always_reject" });
+    } else {
+      await saveSignPolicy(request.origin, { mode: "always_reject" });
+    }
   }
 
-  request.reject(new Error("User rejected"));
+  const rejection = new Error("User rejected");
+  request.reject(rejection);
+  rejectPublicKeyJoiners(request.id, rejection);
   pendingRequests.delete(requestId);
   void onPendingRequestsChanged(pendingRequests.size > 0);
 
@@ -445,15 +629,6 @@ async function broadcastPendingRequestUpdate() {
 }
 
 async function ensureApprovalSurface(): Promise<boolean> {
-  if (approvalWindowId !== null) {
-    try {
-      await browser.windows.update(approvalWindowId, { focused: true });
-      return true;
-    } catch {
-      approvalWindowId = null;
-    }
-  }
-
   if (approvalSurfaceOpening) {
     return approvalSurfaceOpening;
   }
@@ -462,22 +637,9 @@ async function ensureApprovalSurface(): Promise<boolean> {
     try {
       await browser.action.openPopup();
       return true;
-    } catch {
-      try {
-        const created = await browser.windows.create({
-          url: browser.runtime.getURL("index.html#sign-request"),
-          type: "popup",
-          focused: true,
-          width: APPROVAL_WINDOW_WIDTH,
-          height: APPROVAL_WINDOW_HEIGHT,
-        });
-
-        approvalWindowId = created.id ?? null;
-        return true;
-      } catch (error) {
-        console.error("[Nostr Signer] Failed to open approval UI:", error);
-        return false;
-      }
+    } catch (error) {
+      console.error("[Nostr Signer] Failed to open extension popup:", error);
+      return false;
     }
   })();
 
@@ -544,6 +706,19 @@ async function resolveApprovedIdentityId(
 }
 
 async function enforceBackgroundLockPolicy() {
+  try {
+    const result = await browser.storage.local.get(LOCKED_STATE_KEY);
+    if (result[LOCKED_STATE_KEY] === true) {
+      const unlocked = await vault.isUnlocked();
+      if (unlocked) {
+        await vault.lock();
+      }
+      return;
+    }
+  } catch {
+    // Ignore explicit lock read errors.
+  }
+
   let remember = true;
 
   try {
@@ -631,6 +806,17 @@ async function loadSignPolicies(): Promise<SignPolicyMap> {
   }
 }
 
+async function loadPublicKeyPolicies(): Promise<PublicKeyPolicyMap> {
+  try {
+    const result = await browser.storage.local.get(PUBLIC_KEY_POLICY_MAP_KEY);
+    const value = result[PUBLIC_KEY_POLICY_MAP_KEY];
+    if (!value || typeof value !== "object") return {};
+    return value as PublicKeyPolicyMap;
+  } catch {
+    return {};
+  }
+}
+
 async function saveSignPolicy(origin: string, policy: SignPolicy) {
   const policies = await loadSignPolicies();
   policies[origin] = policy;
@@ -645,26 +831,55 @@ async function saveSignPolicies(policies: SignPolicyMap) {
   }
 }
 
+async function savePublicKeyPolicy(origin: string, policy: SignPolicy) {
+  const policies = await loadPublicKeyPolicies();
+  policies[origin] = policy;
+  await savePublicKeyPolicies(policies);
+}
+
+async function savePublicKeyPolicies(policies: PublicKeyPolicyMap) {
+  try {
+    await browser.storage.local.set({ [PUBLIC_KEY_POLICY_MAP_KEY]: policies });
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
 async function buildTrustedWebsiteEntries(): Promise<TrustedWebsiteEntry[]> {
   const signPolicies = await loadSignPolicies();
+  const publicKeyPolicies = await loadPublicKeyPolicies();
   const originProfiles = await loadOriginProfiles();
 
-  const allOrigins = new Set<string>([...Object.keys(signPolicies), ...Object.keys(originProfiles)]);
+  const allOrigins = new Set<string>([
+    ...Object.keys(signPolicies),
+    ...Object.keys(publicKeyPolicies),
+    ...Object.keys(originProfiles),
+  ]);
 
   const entries: TrustedWebsiteEntry[] = [...allOrigins]
     .sort((a, b) => a.localeCompare(b))
     .map((origin) => {
       const signPolicy = signPolicies[origin];
+      const getPublicKeyPolicy = publicKeyPolicies[origin];
       return {
         origin,
+        getPublicKeyPolicy: getPublicKeyPolicy?.mode ?? "ask",
         signPolicy: signPolicy?.mode ?? "ask",
-        policyIdentityId: signPolicy?.mode === "always_allow" ? signPolicy.identityId ?? null : null,
+        policyIdentityId:
+          (signPolicy?.mode === "always_allow" ? signPolicy.identityId : null) ??
+          (getPublicKeyPolicy?.mode === "always_allow" ? getPublicKeyPolicy.identityId : null) ??
+          null,
         boundProfileId: originProfiles[origin] ?? null,
         capabilities: [
           {
             key: "get_public_key",
             label: "Get public key",
-            state: "allow",
+            state:
+              getPublicKeyPolicy?.mode === "always_allow"
+                ? "allow"
+                : getPublicKeyPolicy?.mode === "always_reject"
+                  ? "deny"
+                  : "ask",
           },
           {
             key: "sign_event",
