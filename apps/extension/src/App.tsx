@@ -28,11 +28,13 @@ interface TrustedWebsiteEntry {
   capabilities: TrustedCapability[];
 }
 
-const CAPABILITY_STATE_LABEL: Record<TrustedCapabilityState, string> = {
-  allow: "Allowed",
-  ask: "Ask",
-  deny: "Blocked",
-};
+interface PendingRequestState {
+  id: string;
+  origin: string;
+  event: any;
+  selectedIdentityId: string | null;
+  autoApprove: boolean;
+}
 
 const KNOWN_KIND_LABELS: Record<number, string> = {
   0: "Profile metadata update",
@@ -122,12 +124,15 @@ function SignRequestScreen({
     setLoading(true);
     setError("");
     try {
-      await browser.runtime.sendMessage({
+      const response = await browser.runtime.sendMessage({
         type: "APPROVE_REQUEST",
         requestId,
         identityId: selectedProfileId,
         alwaysAllow,
       });
+      if (response?.error) {
+        throw new Error(response.error);
+      }
       completeAndClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to sign");
@@ -139,11 +144,14 @@ function SignRequestScreen({
     setLoading(true);
     setError("");
     try {
-      await browser.runtime.sendMessage({
+      const response = await browser.runtime.sendMessage({
         type: "REJECT_REQUEST",
         requestId,
         alwaysReject,
       });
+      if (response?.error) {
+        throw new Error(response.error);
+      }
       completeAndClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to reject");
@@ -590,19 +598,12 @@ export default function App() {
   const [rememberUnlock, setRememberUnlock] = useState(true);
   const [defaultProfileId, setDefaultProfileId] = useState<string | null>(null);
   const [identities, setIdentities] = useState<IdentityRecord[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
   const [isLocked, setIsLocked] = useState(true);
   const [hasPin, setHasPin] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   
   // Pending sign request
-  const [pendingRequest, setPendingRequest] = useState<{
-    id: string;
-    origin: string;
-    event: any;
-    selectedIdentityId: string | null;
-    autoApprove: boolean;
-  } | null>(null);
+  const [pendingRequest, setPendingRequest] = useState<PendingRequestState | null>(null);
   
   // Modals
   const [showCreate, setShowCreate] = useState(false);
@@ -620,7 +621,7 @@ export default function App() {
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
   const [trustedSites, setTrustedSites] = useState<TrustedWebsiteEntry[]>([]);
   const [trustedSiteDrafts, setTrustedSiteDrafts] = useState<
-    Record<string, { signPolicy: TrustedSignPolicyMode; policyIdentityId: string; boundProfileId: string }>
+    Record<string, { signPolicy: TrustedSignPolicyMode; boundProfileId: string }>
   >({});
   const [trustedSitesLoading, setTrustedSitesLoading] = useState(false);
   
@@ -631,14 +632,37 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     const list = await vault.listIdentities();
-    const active = await vault.getActiveIdentity();
     setIdentities(list);
-    setActiveId(active?.id ?? null);
   }, []);
 
   const showToast = useCallback((message: string, type: "success" | "error" = "success") => {
     setToast({ message, type });
   }, []);
+
+  const normalizePendingRequest = useCallback((raw: unknown): PendingRequestState | null => {
+    if (!raw || typeof raw !== "object") return null;
+    const request = raw as Record<string, unknown>;
+    if (typeof request.id !== "string" || !request.id) return null;
+    if (typeof request.origin !== "string" || !request.origin) return null;
+    if (!("event" in request)) return null;
+
+    return {
+      id: request.id,
+      origin: request.origin,
+      event: request.event,
+      selectedIdentityId: typeof request.selectedIdentityId === "string" ? request.selectedIdentityId : null,
+      autoApprove: Boolean(request.autoApprove),
+    };
+  }, []);
+
+  const refreshPendingRequest = useCallback(async () => {
+    try {
+      const response = await browser.runtime.sendMessage({ type: "GET_LATEST_PENDING_REQUEST" });
+      setPendingRequest(normalizePendingRequest(response?.pendingRequest));
+    } catch {
+      setPendingRequest(null);
+    }
+  }, [normalizePendingRequest]);
 
   const refreshTrustedSites = useCallback(async () => {
     setTrustedSitesLoading(true);
@@ -675,7 +699,7 @@ export default function App() {
             const capabilities = Array.isArray(entry?.capabilities)
               ? (entry.capabilities as any[])
                   .map((capability) => {
-                    const key =
+                    const key: TrustedCapability["key"] =
                       capability?.key === "sign_event" ? "sign_event" : "get_public_key";
                     const state: TrustedCapabilityState =
                       capability?.state === "allow" ||
@@ -711,14 +735,10 @@ export default function App() {
         : [];
       setTrustedSites(entries);
 
-      const nextDrafts: Record<
-        string,
-        { signPolicy: TrustedSignPolicyMode; policyIdentityId: string; boundProfileId: string }
-      > = {};
+      const nextDrafts: Record<string, { signPolicy: TrustedSignPolicyMode; boundProfileId: string }> = {};
       entries.forEach((entry) => {
         nextDrafts[entry.origin] = {
           signPolicy: entry.signPolicy,
-          policyIdentityId: entry.policyIdentityId ?? "",
           boundProfileId: entry.boundProfileId ?? "",
         };
       });
@@ -785,37 +805,7 @@ export default function App() {
         // Ignore preference loading errors
       }
 
-      // Check for pending sign request first
-      try {
-        const session = await browser.storage.session.get([
-          "pendingRequestId",
-          "pendingOrigin",
-          "pendingEvent",
-          "pendingSelectedIdentityId",
-          "pendingAutoApprove",
-        ]);
-        if (session.pendingRequestId) {
-          setPendingRequest({
-            id: session.pendingRequestId,
-            origin: session.pendingOrigin,
-            event: session.pendingEvent,
-            selectedIdentityId:
-              typeof session.pendingSelectedIdentityId === "string"
-                ? session.pendingSelectedIdentityId
-                : null,
-            autoApprove: Boolean(session.pendingAutoApprove),
-          });
-          await browser.storage.session.remove([
-            "pendingRequestId",
-            "pendingOrigin",
-            "pendingEvent",
-            "pendingSelectedIdentityId",
-            "pendingAutoApprove",
-          ]);
-        }
-      } catch {
-        // Session storage not available
-      }
+      await refreshPendingRequest();
 
       const pinSet = await vault.isPinSet();
       setHasPin(pinSet);
@@ -864,7 +854,22 @@ export default function App() {
       setIsLoading(false);
     };
     void init();
-  }, [refresh, refreshTrustedSites]);
+  }, [refresh, refreshPendingRequest, refreshTrustedSites]);
+
+  useEffect(() => {
+    const handleRuntimeMessage = (message: unknown) => {
+      if (!message || typeof message !== "object") return undefined;
+      const payload = message as Record<string, unknown>;
+      if (payload.type !== "PENDING_REQUEST_UPDATED") return undefined;
+      setPendingRequest(normalizePendingRequest(payload.pendingRequest));
+      return undefined;
+    };
+
+    browser.runtime.onMessage.addListener(handleRuntimeMessage);
+    return () => {
+      browser.runtime.onMessage.removeListener(handleRuntimeMessage);
+    };
+  }, [normalizePendingRequest]);
 
   const handleToggleTheme = async () => {
     const nextTheme: ThemeMode = theme === "light" ? "dark" : "light";
@@ -1051,15 +1056,6 @@ export default function App() {
     }
   };
 
-  const handleActivate = async (id: string) => {
-    try {
-      await vault.setActiveIdentity(id);
-      await refresh();
-    } catch (err) {
-      alert(err instanceof Error ? err.message : "Failed to activate");
-    }
-  };
-
   const handleSetDefaultProfile = async (id: string) => {
     setDefaultProfileId(id);
     try {
@@ -1073,10 +1069,10 @@ export default function App() {
   const updateTrustedSiteDraft = useCallback(
     (
       origin: string,
-      updates: Partial<{ signPolicy: TrustedSignPolicyMode; policyIdentityId: string; boundProfileId: string }>
+      updates: Partial<{ signPolicy: TrustedSignPolicyMode; boundProfileId: string }>
     ) => {
       setTrustedSiteDrafts((prev) => {
-        const current = prev[origin] ?? { signPolicy: "ask", policyIdentityId: "", boundProfileId: "" };
+        const current = prev[origin] ?? { signPolicy: "ask", boundProfileId: "" };
         return {
           ...prev,
           [origin]: {
@@ -1090,8 +1086,8 @@ export default function App() {
   );
 
   const resolveDefaultProfileForPolicy = useCallback(() => {
-    return defaultProfileId ?? activeId ?? identities[0]?.id ?? "";
-  }, [activeId, defaultProfileId, identities]);
+    return defaultProfileId ?? identities[0]?.id ?? "";
+  }, [defaultProfileId, identities]);
 
   const handleSaveTrustedWebsite = useCallback(
     async (origin: string) => {
@@ -1106,11 +1102,11 @@ export default function App() {
       } = {
         origin,
         signPolicy: draft.signPolicy,
-        policyIdentityId: draft.policyIdentityId || null,
         boundProfileId: draft.boundProfileId || null,
+        policyIdentityId: null,
       };
 
-      if (payload.signPolicy === "always_allow" && !payload.policyIdentityId) {
+      if (payload.signPolicy === "always_allow") {
         payload.policyIdentityId = payload.boundProfileId || resolveDefaultProfileForPolicy() || null;
       }
 
@@ -1221,6 +1217,7 @@ export default function App() {
           setPendingRequest(null);
           void refresh();
           void refreshTrustedSites();
+          void refreshPendingRequest();
         }}
       />
     );
@@ -1323,11 +1320,8 @@ export default function App() {
             style={{
               padding: "12px",
               borderRadius: "8px",
-              border:
-                id.id === activeId || id.id === defaultProfileId
-                  ? "2px solid var(--accent)"
-                  : "1px solid var(--border-muted)",
-              background: id.id === activeId ? "var(--card-active-bg)" : "var(--card-bg)",
+              border: id.id === defaultProfileId ? "2px solid var(--accent)" : "1px solid var(--border-muted)",
+              background: id.id === defaultProfileId ? "var(--card-active-bg)" : "var(--card-bg)",
             }}
           >
             <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
@@ -1378,25 +1372,6 @@ export default function App() {
               </div>
               
               <div style={{ display: "flex", gap: "6px", flexShrink: 0, alignItems: "center" }}>
-                {id.id === activeId ? (
-                  <span style={{ color: "var(--active-text)", fontSize: "12px" }}>Active</span>
-                ) : (
-                  <button
-                    onClick={() => handleActivate(id.id)}
-                    style={{
-                      padding: "6px 10px",
-                      background: "transparent",
-                      border: "1px solid var(--border-strong)",
-                      color: "var(--text-primary)",
-                      borderRadius: "4px",
-                      cursor: "pointer",
-                      fontSize: "11px",
-                    }}
-                  >
-                    Use
-                  </button>
-                )}
-
                 <button
                   onClick={() => openNpubDialog(id.pubkey)}
                   title="Public"
@@ -1506,7 +1481,7 @@ export default function App() {
       >
         <h3 style={{ margin: "0 0 10px 0", fontSize: "15px" }}>Trusted Websites</h3>
         <p style={{ margin: "0 0 10px 0", color: "var(--text-muted)", fontSize: "12px" }}>
-          Websites appear here automatically after you choose Always Allow or Always Reject.
+          Websites appear here after you choose Always Allow or Always Reject.
         </p>
 
         {trustedSitesLoading ? (
@@ -1520,38 +1495,22 @@ export default function App() {
             {trustedSites.map((site) => {
               const draft = trustedSiteDrafts[site.origin] ?? {
                 signPolicy: site.signPolicy,
-                policyIdentityId: site.policyIdentityId ?? "",
                 boundProfileId: site.boundProfileId ?? "",
               };
-              const displayedCapabilities: TrustedCapability[] = (
-                site.capabilities.length
-                  ? site.capabilities
-                  : [
-                      { key: "get_public_key", label: "Get public key", state: "allow" },
-                      {
-                        key: "sign_event",
-                        label: "Sign events",
-                        state:
-                          site.signPolicy === "always_allow"
-                            ? "allow"
-                            : site.signPolicy === "always_reject"
-                              ? "deny"
-                              : "ask",
-                      },
-                    ]
-              ).map((capability) =>
-                capability.key === "sign_event"
-                  ? {
-                      ...capability,
-                      state:
-                        draft.signPolicy === "always_allow"
-                          ? "allow"
-                          : draft.signPolicy === "always_reject"
-                            ? "deny"
-                            : "ask",
-                    }
-                  : capability
-              );
+              const signingStatusLabel =
+                draft.signPolicy === "always_allow"
+                  ? "Always allow"
+                  : draft.signPolicy === "always_reject"
+                    ? "Always reject"
+                    : "Ask every time";
+              const signingStatusColor =
+                draft.signPolicy === "always_allow"
+                  ? "var(--active-text)"
+                  : draft.signPolicy === "always_reject"
+                    ? "var(--danger)"
+                    : "var(--text-muted)";
+              const siteProfileLabel =
+                identities.find((identity) => identity.id === draft.boundProfileId)?.label ?? "Global default";
 
               return (
                 <div
@@ -1563,57 +1522,52 @@ export default function App() {
                     background: "var(--surface-muted)",
                   }}
                 >
-                  <div
-                    style={{
-                      fontFamily: "monospace",
-                      fontSize: "12px",
-                      color: "var(--text-primary)",
-                      marginBottom: "8px",
-                      wordBreak: "break-all",
-                    }}
-                  >
-                    {site.origin}
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: "10px", marginBottom: "8px" }}>
+                    <div
+                      style={{
+                        fontFamily: "monospace",
+                        fontSize: "12px",
+                        color: "var(--text-primary)",
+                        wordBreak: "break-all",
+                      }}
+                    >
+                      {site.origin}
+                    </div>
+                    <span
+                      style={{
+                        whiteSpace: "nowrap",
+                        fontSize: "11px",
+                        padding: "3px 8px",
+                        borderRadius: "999px",
+                        border: "1px solid var(--border-muted)",
+                        background: "var(--surface-soft)",
+                        color: signingStatusColor,
+                        height: "fit-content",
+                      }}
+                    >
+                      {signingStatusLabel}
+                    </span>
                   </div>
 
-                  <div style={{ marginBottom: "8px" }}>
-                    <div style={{ fontSize: "11px", color: "var(--text-muted)", marginBottom: "4px" }}>
-                      Enabled functionality
-                    </div>
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
-                      {displayedCapabilities.map((capability) => (
-                        <span
-                          key={`${site.origin}-${capability.key}`}
-                          style={{
-                            display: "inline-flex",
-                            alignItems: "center",
-                            gap: "4px",
-                            fontSize: "11px",
-                            borderRadius: "999px",
-                            padding: "4px 8px",
-                            border: "1px solid var(--border-muted)",
-                            background:
-                              capability.state === "allow"
-                                ? "color-mix(in srgb, var(--active-text) 12%, transparent)"
-                                : capability.state === "deny"
-                                  ? "color-mix(in srgb, var(--danger) 12%, transparent)"
-                                  : "var(--surface-soft)",
-                            color:
-                              capability.state === "allow"
-                                ? "var(--active-text)"
-                                : capability.state === "deny"
-                                  ? "var(--danger)"
-                                  : "var(--text-muted)",
-                          }}
-                        >
-                          <strong style={{ fontWeight: 600 }}>{capability.label}</strong>
-                          <span>{CAPABILITY_STATE_LABEL[capability.state]}</span>
-                        </span>
-                      ))}
-                    </div>
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "auto 1fr",
+                      gap: "4px 8px",
+                      fontSize: "12px",
+                      marginBottom: "10px",
+                    }}
+                  >
+                    <span style={{ color: "var(--text-muted)" }}>Public key:</span>
+                    <span style={{ color: "var(--active-text)" }}>Always allowed</span>
+                    <span style={{ color: "var(--text-muted)" }}>Sign events:</span>
+                    <span style={{ color: signingStatusColor }}>{signingStatusLabel}</span>
+                    <span style={{ color: "var(--text-muted)" }}>Site profile:</span>
+                    <span style={{ color: "var(--text-primary)" }}>{siteProfileLabel}</span>
                   </div>
 
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
-                    <label style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+                    <label style={{ fontSize: "12px", color: "var(--text-muted)", gridColumn: "1 / span 2" }}>
                       Sign events
                       <select
                         value={draft.signPolicy}
@@ -1638,36 +1592,8 @@ export default function App() {
                       </select>
                     </label>
 
-                    <label style={{ fontSize: "12px", color: "var(--text-muted)" }}>
-                      Always allow profile
-                      <select
-                        value={draft.policyIdentityId}
-                        onChange={(e) =>
-                          updateTrustedSiteDraft(site.origin, {
-                            policyIdentityId: e.target.value,
-                          })
-                        }
-                        style={{
-                          width: "100%",
-                          marginTop: "4px",
-                          padding: "8px",
-                          borderRadius: "6px",
-                          border: "1px solid var(--border-muted)",
-                          background: "var(--surface-elevated)",
-                          color: "var(--text-primary)",
-                        }}
-                      >
-                        <option value="">Use site/default profile</option>
-                        {identities.map((identity) => (
-                          <option key={identity.id} value={identity.id}>
-                            {identity.label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-
                     <label style={{ fontSize: "12px", color: "var(--text-muted)", gridColumn: "1 / span 2" }}>
-                      Site profile (used by public key and default site actions)
+                      Site profile
                       <select
                         value={draft.boundProfileId}
                         onChange={(e) =>

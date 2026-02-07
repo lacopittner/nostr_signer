@@ -1,3 +1,4 @@
+import type { IdentityRecord, SignedNostrEvent } from "@nostr-signer/signer-core";
 import browser from "webextension-polyfill";
 import { vault } from "./lib/vault";
 
@@ -6,13 +7,16 @@ const ORIGIN_PROFILE_MAP_KEY = "nostr_signer_origin_profile_map";
 const SIGN_POLICY_MAP_KEY = "nostr_signer_sign_policy_map";
 const REMEMBER_UNLOCK_KEY = "nostr_signer_remember_unlock";
 const SESSION_UNLOCK_KEY = "nostr_signer_session_unlock";
+const APPROVAL_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+const APPROVAL_WINDOW_WIDTH = 520;
+const APPROVAL_WINDOW_HEIGHT = 760;
+
 const DEFAULT_RELAYS: Record<string, { read: boolean; write: boolean }> = {
   "wss://relay.damus.io": { read: true, write: true },
   "wss://nos.lol": { read: true, write: true },
   "wss://relay.primal.net": { read: true, write: true },
 };
-const APPROVAL_WINDOW_WIDTH = 520;
-const APPROVAL_WINDOW_HEIGHT = 760;
+
 type SignPolicyMode = "always_allow" | "always_reject";
 
 interface SignPolicy {
@@ -22,6 +26,7 @@ interface SignPolicy {
 
 type SignPolicyMap = Record<string, SignPolicy>;
 type OriginProfileMap = Record<string, string>;
+
 type TrustedSignPolicyMode = "ask" | SignPolicyMode;
 type TrustedCapabilityState = "allow" | "ask" | "deny";
 
@@ -39,53 +44,84 @@ interface TrustedWebsiteEntry {
   capabilities: TrustedCapability[];
 }
 
-// Pending sign requests
-interface PendingRequest {
+interface SignEventPayload {
+  kind: number;
+  content: string;
+  tags: string[][];
+  created_at?: number;
+}
+
+interface PendingSignRequest {
   id: string;
-  type: string;
   origin: string;
-  payload: any;
+  payload: SignEventPayload;
   selectedIdentityId: string | null;
   autoApprove: boolean;
-  resolve: (value: any) => void;
-  reject: (reason: any) => void;
+  resolve: (value: SignedNostrEvent) => void;
+  reject: (reason: Error) => void;
   timestamp: number;
 }
 
-const pendingRequests = new Map<string, PendingRequest>();
-let approvalWindowId: number | null = null;
+interface PopupPendingRequest {
+  id: string;
+  origin: string;
+  event: SignEventPayload;
+  selectedIdentityId: string | null;
+  autoApprove: boolean;
+}
 
-// Clean old requests every minute
+const pendingRequests = new Map<string, PendingSignRequest>();
+let approvalWindowId: number | null = null;
+let approvalSurfaceOpening: Promise<boolean> | null = null;
+
+browser.runtime.onInstalled.addListener(() => {
+  console.info("Nostr Signer installed");
+});
+
+browser.windows.onRemoved.addListener((windowId: number) => {
+  if (windowId === approvalWindowId) {
+    approvalWindowId = null;
+  }
+});
+
 setInterval(() => {
   const now = Date.now();
-  for (const [id, req] of pendingRequests) {
-    if (now - req.timestamp > 5 * 60 * 1000) {
-      // 5 min timeout
-      req.reject(new Error("Request timeout"));
-      pendingRequests.delete(id);
+  let removedAny = false;
+  for (const [requestId, request] of pendingRequests) {
+    if (now - request.timestamp > APPROVAL_REQUEST_TIMEOUT_MS) {
+      request.reject(new Error("Request timeout"));
+      pendingRequests.delete(requestId);
+      removedAny = true;
     }
   }
-}, 60000);
+  if (removedAny) {
+    void onPendingRequestsChanged(pendingRequests.size > 0);
+  }
+}, 60_000);
 
-// Handle messages from content script
-browser.runtime.onMessage.addListener(async (message) => {
-  const { type, payload, origin } = message;
+browser.runtime.onMessage.addListener(async (message: unknown) => {
+  const data = toRecord(message);
+  const type = asString(data.type);
 
   switch (type) {
     case "NOSTR_GET_PUBLIC_KEY": {
       try {
         await vault.reload();
         await enforceBackgroundLockPolicy();
-        const identity = await resolveIdentityForOrigin(origin || "unknown");
+
+        const requestOrigin = parseRequestOrigin(data.origin);
+        const identity = await resolveIdentityForOrigin(requestOrigin);
         if (!identity) {
           return { error: "No identity available" };
         }
-        if (origin) {
-          await bindOriginProfile(origin, identity.id);
+
+        if (requestOrigin !== "unknown") {
+          await bindOriginProfile(requestOrigin, identity.id);
         }
+
         return identity.pubkey;
-      } catch (err) {
-        return { error: err instanceof Error ? err.message : "Unknown error" };
+      } catch (error) {
+        return { error: toErrorMessage(error, "Failed to get public key") };
       }
     }
 
@@ -97,7 +133,9 @@ browser.runtime.onMessage.addListener(async (message) => {
       try {
         await vault.reload();
         await enforceBackgroundLockPolicy();
-        const requestOrigin = origin || "unknown";
+
+        const requestOrigin = parseRequestOrigin(data.origin);
+        const payload = normalizeSignEventPayload(data.payload);
         const identity = await resolveIdentityForOrigin(requestOrigin);
         if (!identity) {
           return { error: "No identity available" };
@@ -113,76 +151,38 @@ browser.runtime.onMessage.addListener(async (message) => {
         if (policy?.mode === "always_allow") {
           const policyIdentity = await resolveIdentityById(policy.identityId ?? null);
           const selectedIdentity = policyIdentity ?? identity;
-
           const unlocked = await vault.isUnlocked();
-          if (!unlocked) {
-            await showNotification("Nostr Signer", `${requestOrigin} requests signature. Unlock to continue.`);
 
-            const requestId = crypto.randomUUID();
-            return new Promise((resolve, reject) => {
-              pendingRequests.set(requestId, {
-                id: requestId,
-                type: "SIGN_EVENT",
-                origin: requestOrigin,
-                payload,
-                selectedIdentityId: selectedIdentity.id,
-                autoApprove: true,
-                resolve,
-                reject,
-                timestamp: Date.now(),
-              });
-
-              void showSignConfirmation(requestId, requestOrigin, payload, selectedIdentity.id, true).then(
-                (opened) => {
-                  if (opened) return;
-                  const pending = pendingRequests.get(requestId);
-                  if (!pending) return;
-                  pending.reject(new Error("Unable to open approval window. Click extension icon and try again."));
-                  pendingRequests.delete(requestId);
-                }
-              );
-            });
+          if (unlocked) {
+            const signed = await signEventWithIdentity(payload, selectedIdentity.id);
+            if (requestOrigin !== "unknown") {
+              await bindOriginProfile(requestOrigin, selectedIdentity.id);
+            }
+            return signed;
           }
 
-          const signed = await signEventWithIdentity(payload, selectedIdentity.id);
-          await bindOriginProfile(requestOrigin, selectedIdentity.id);
-          return signed;
+          await showNotification("Nostr Signer", `${requestOrigin} requests signature. Unlock to continue.`);
+          return await queuePendingSignRequest({
+            origin: requestOrigin,
+            payload,
+            selectedIdentityId: selectedIdentity.id,
+            autoApprove: true,
+          });
         }
 
-        // For manual approval flow we can proceed even when locked.
-        // Popup will first show unlock and then signing confirmation.
         const unlocked = await vault.isUnlocked();
         if (!unlocked) {
           await showNotification("Nostr Signer", `${requestOrigin} requests signature. Unlock to continue.`);
         }
 
-        // Create pending request
-        const requestId = crypto.randomUUID();
-        
-        return new Promise((resolve, reject) => {
-          pendingRequests.set(requestId, {
-            id: requestId,
-            type: "SIGN_EVENT",
-            origin: requestOrigin,
-            payload,
-            selectedIdentityId: identity.id,
-            autoApprove: false,
-            resolve,
-            reject,
-            timestamp: Date.now(),
-          });
-
-          // Open popup for confirmation
-          void showSignConfirmation(requestId, requestOrigin, payload, identity.id, false).then((opened) => {
-            if (opened) return;
-            const pending = pendingRequests.get(requestId);
-            if (!pending) return;
-            pending.reject(new Error("Unable to open approval window. Click extension icon and try again."));
-            pendingRequests.delete(requestId);
-          });
+        return await queuePendingSignRequest({
+          origin: requestOrigin,
+          payload,
+          selectedIdentityId: identity.id,
+          autoApprove: false,
         });
-      } catch (err) {
-        return { error: err instanceof Error ? err.message : "Failed to sign" };
+      } catch (error) {
+        return { error: toErrorMessage(error, "Failed to sign") };
       }
     }
 
@@ -194,17 +194,25 @@ browser.runtime.onMessage.addListener(async (message) => {
     }
 
     case "GET_PENDING_REQUEST": {
-      // Called by popup to get pending request
-      const req = pendingRequests.get(message.requestId);
-      return req || null;
+      const requestId = asString(data.requestId);
+      const request = requestId ? pendingRequests.get(requestId) ?? null : null;
+      return { pendingRequest: toPopupPendingRequest(request) };
+    }
+
+    case "GET_LATEST_PENDING_REQUEST": {
+      return { pendingRequest: getLatestPopupPendingRequest() };
     }
 
     case "UNLOCK_VAULT": {
-      const pin = typeof message.pin === "string" ? message.pin : "";
-      const ttlMs = typeof message.ttlMs === "number" && Number.isFinite(message.ttlMs) ? message.ttlMs : undefined;
-      if (!pin) return { error: "PIN is required" };
-      const unlocked = await vault.unlock(pin, ttlMs);
-      if (!unlocked) return { error: "Invalid PIN" };
+      const pin = asString(data.pin);
+      const ttlMs = asFiniteNumber(data.ttlMs);
+      if (!pin) {
+        return { error: "PIN is required" };
+      }
+      const unlocked = await vault.unlock(pin, ttlMs ?? undefined);
+      if (!unlocked) {
+        return { error: "Invalid PIN" };
+      }
       return { success: true };
     }
 
@@ -219,14 +227,18 @@ browser.runtime.onMessage.addListener(async (message) => {
     }
 
     case "UPDATE_TRUSTED_WEBSITE": {
-      const requestOrigin = normalizeOrigin(message.payload?.origin);
-      if (!requestOrigin) return { error: "Invalid origin" };
+      const payload = toRecord(data.payload);
+      const requestOrigin = normalizeOrigin(payload.origin);
+      if (!requestOrigin) {
+        return { error: "Invalid origin" };
+      }
 
-      const signPolicy = message.payload?.signPolicy as TrustedSignPolicyMode | undefined;
-      const requestedPolicyIdentityId =
-        typeof message.payload?.policyIdentityId === "string" ? message.payload.policyIdentityId : null;
-      const requestedBoundProfileId =
-        typeof message.payload?.boundProfileId === "string" ? message.payload.boundProfileId : null;
+      const signPolicyRaw = asString(payload.signPolicy);
+      const signPolicy: TrustedSignPolicyMode =
+        signPolicyRaw === "always_allow" || signPolicyRaw === "always_reject" ? signPolicyRaw : "ask";
+
+      const requestedPolicyIdentityId = asString(payload.policyIdentityId) || null;
+      const requestedBoundProfileId = asString(payload.boundProfileId) || null;
 
       const signPolicies = await loadSignPolicies();
       const originProfiles = await loadOriginProfiles();
@@ -252,7 +264,7 @@ browser.runtime.onMessage.addListener(async (message) => {
           return { error: "Bound profile not found" };
         }
         originProfiles[requestOrigin] = requestedBoundProfileId;
-      } else if (message.payload?.boundProfileId === null || message.payload?.boundProfileId === "") {
+      } else if (payload.boundProfileId === null || payload.boundProfileId === "") {
         delete originProfiles[requestOrigin];
       }
 
@@ -264,8 +276,11 @@ browser.runtime.onMessage.addListener(async (message) => {
     }
 
     case "REMOVE_TRUSTED_WEBSITE": {
-      const requestOrigin = normalizeOrigin(message.payload?.origin);
-      if (!requestOrigin) return { error: "Invalid origin" };
+      const payload = toRecord(data.payload);
+      const requestOrigin = normalizeOrigin(payload.origin);
+      if (!requestOrigin) {
+        return { error: "Invalid origin" };
+      }
 
       const signPolicies = await loadSignPolicies();
       const originProfiles = await loadOriginProfiles();
@@ -281,52 +296,22 @@ browser.runtime.onMessage.addListener(async (message) => {
     }
 
     case "APPROVE_REQUEST": {
-      // Called by popup when user approves
-      const req = pendingRequests.get(message.requestId);
-      if (!req) return { error: "Request not found" };
-
-      try {
-        if (req.type === "SIGN_EVENT") {
-          const identityId = await resolveApprovedIdentityId(
-            typeof message.identityId === "string" ? message.identityId : null,
-            req.selectedIdentityId
-          );
-
-          if (!identityId) {
-            throw new Error("No profile selected");
-          }
-
-          const signed = await signEventWithIdentity(req.payload, identityId);
-
-          if (req.origin) {
-            await bindOriginProfile(req.origin, identityId);
-          }
-          if (message.alwaysAllow && req.origin) {
-            await saveSignPolicy(req.origin, { mode: "always_allow", identityId });
-          }
-
-          req.resolve(signed);
-        }
-        pendingRequests.delete(message.requestId);
-        return { success: true };
-      } catch (err) {
-        req.reject(err instanceof Error ? err : new Error("Signing failed"));
-        pendingRequests.delete(message.requestId);
-        return { error: err instanceof Error ? err.message : "Signing failed" };
+      const requestId = asString(data.requestId);
+      if (!requestId) {
+        return { error: "Request not found" };
       }
+      const identityId = asString(data.identityId) || null;
+      const alwaysAllow = Boolean(data.alwaysAllow);
+      return approvePendingRequest(requestId, identityId, alwaysAllow);
     }
 
     case "REJECT_REQUEST": {
-      // Called by popup when user rejects
-      const req = pendingRequests.get(message.requestId);
-      if (req) {
-        if (message.alwaysReject && req.origin) {
-          await saveSignPolicy(req.origin, { mode: "always_reject" });
-        }
-        req.reject(new Error("User rejected"));
-        pendingRequests.delete(message.requestId);
+      const requestId = asString(data.requestId);
+      if (!requestId) {
+        return { error: "Request not found" };
       }
-      return { success: true };
+      const alwaysReject = Boolean(data.alwaysReject);
+      return rejectPendingRequest(requestId, alwaysReject);
     }
 
     case "PING": {
@@ -338,6 +323,175 @@ browser.runtime.onMessage.addListener(async (message) => {
   }
 });
 
+function getLatestPendingRequest(): PendingSignRequest | null {
+  for (const request of pendingRequests.values()) {
+    return request;
+  }
+  return null;
+}
+
+function toPopupPendingRequest(request: PendingSignRequest | null): PopupPendingRequest | null {
+  if (!request) return null;
+  return {
+    id: request.id,
+    origin: request.origin,
+    event: request.payload,
+    selectedIdentityId: request.selectedIdentityId,
+    autoApprove: request.autoApprove,
+  };
+}
+
+function getLatestPopupPendingRequest(): PopupPendingRequest | null {
+  return toPopupPendingRequest(getLatestPendingRequest());
+}
+
+async function queuePendingSignRequest(params: {
+  origin: string;
+  payload: SignEventPayload;
+  selectedIdentityId: string | null;
+  autoApprove: boolean;
+}): Promise<SignedNostrEvent> {
+  const requestId = crypto.randomUUID();
+
+  return new Promise<SignedNostrEvent>((resolve, reject) => {
+    pendingRequests.set(requestId, {
+      id: requestId,
+      origin: params.origin,
+      payload: params.payload,
+      selectedIdentityId: params.selectedIdentityId,
+      autoApprove: params.autoApprove,
+      resolve,
+      reject,
+      timestamp: Date.now(),
+    });
+
+    const shouldOpenSurface = pendingRequests.size === 1;
+    void onPendingRequestsChanged(shouldOpenSurface);
+  });
+}
+
+async function approvePendingRequest(requestId: string, requestedIdentityId: string | null, alwaysAllow: boolean) {
+  const request = pendingRequests.get(requestId);
+  if (!request) {
+    return { error: "Request not found" };
+  }
+
+  try {
+    const identityId = await resolveApprovedIdentityId(requestedIdentityId, request.selectedIdentityId);
+    if (!identityId) {
+      throw new Error("No profile selected");
+    }
+
+    const signed = await signEventWithIdentity(request.payload, identityId);
+
+    if (request.origin !== "unknown") {
+      await bindOriginProfile(request.origin, identityId);
+      if (alwaysAllow) {
+        await saveSignPolicy(request.origin, { mode: "always_allow", identityId });
+      }
+    }
+
+    request.resolve(signed);
+    return { success: true };
+  } catch (error) {
+    const normalized = toError(error, "Signing failed");
+    request.reject(normalized);
+    return { error: normalized.message };
+  } finally {
+    pendingRequests.delete(requestId);
+    void onPendingRequestsChanged(pendingRequests.size > 0);
+  }
+}
+
+async function rejectPendingRequest(requestId: string, alwaysReject: boolean) {
+  const request = pendingRequests.get(requestId);
+  if (!request) {
+    return { success: true };
+  }
+
+  if (alwaysReject && request.origin !== "unknown") {
+    await saveSignPolicy(request.origin, { mode: "always_reject" });
+  }
+
+  request.reject(new Error("User rejected"));
+  pendingRequests.delete(requestId);
+  void onPendingRequestsChanged(pendingRequests.size > 0);
+
+  return { success: true };
+}
+
+async function onPendingRequestsChanged(shouldOpenSurface: boolean) {
+  await broadcastPendingRequestUpdate();
+  if (!shouldOpenSurface) return;
+
+  const opened = await ensureApprovalSurface();
+  if (!opened) {
+    await showNotification(
+      "Nostr Signer",
+      "Signature request pending. Open the extension popup to approve or reject."
+    );
+  }
+}
+
+async function broadcastPendingRequestUpdate() {
+  try {
+    await browser.runtime.sendMessage({
+      type: "PENDING_REQUEST_UPDATED",
+      pendingRequest: getLatestPopupPendingRequest(),
+    });
+  } catch {
+    // No live listeners is normal.
+  }
+}
+
+async function ensureApprovalSurface(): Promise<boolean> {
+  if (approvalWindowId !== null) {
+    try {
+      await browser.windows.update(approvalWindowId, { focused: true });
+      return true;
+    } catch {
+      approvalWindowId = null;
+    }
+  }
+
+  if (approvalSurfaceOpening) {
+    return approvalSurfaceOpening;
+  }
+
+  const opening = (async () => {
+    try {
+      await browser.action.openPopup();
+      return true;
+    } catch {
+      try {
+        const created = await browser.windows.create({
+          url: browser.runtime.getURL("index.html#sign-request"),
+          type: "popup",
+          focused: true,
+          width: APPROVAL_WINDOW_WIDTH,
+          height: APPROVAL_WINDOW_HEIGHT,
+        });
+
+        approvalWindowId = created.id ?? null;
+        return true;
+      } catch (error) {
+        console.error("[Nostr Signer] Failed to open approval UI:", error);
+        return false;
+      }
+    }
+  })();
+
+  approvalSurfaceOpening = opening;
+
+  try {
+    return await opening;
+  } finally {
+    if (approvalSurfaceOpening === opening) {
+      approvalSurfaceOpening = null;
+    }
+  }
+}
+
 async function showNotification(title: string, message: string) {
   try {
     await browser.notifications.create({
@@ -347,48 +501,11 @@ async function showNotification(title: string, message: string) {
       message,
     });
   } catch {
-    // Notifications may not be supported
+    // Notifications may not be supported.
   }
 }
 
-async function showSignConfirmation(
-  requestId: string,
-  origin: string,
-  event: any,
-  selectedIdentityId: string | null,
-  autoApprove: boolean
-): Promise<boolean> {
-  try {
-    // Store request ID so popup can access it
-    await browser.storage.session.set({
-      pendingRequestId: requestId,
-      pendingOrigin: origin,
-      pendingEvent: event,
-      pendingSelectedIdentityId: selectedIdentityId,
-      pendingAutoApprove: autoApprove,
-    });
-
-    // Prefer opening the extension popup (as if user clicked extension icon).
-    // If browser blocks it due missing user gesture, fallback to dedicated popup window.
-    try {
-      await browser.action.openPopup();
-      return true;
-    } catch (err) {
-      console.warn("[Nostr Signer] action.openPopup failed, using popup-window fallback:", err);
-      return openApprovalWindow();
-    }
-  } catch (err) {
-    console.error("[Nostr Signer] Failed to prepare sign confirmation:", err);
-    // If session storage fails, still try to open approval surface.
-    return openApprovalWindow();
-  }
-}
-
-browser.runtime.onInstalled.addListener(() => {
-  console.info("Nostr Signer installed");
-});
-
-async function resolveIdentityForOrigin(origin: string) {
+async function resolveIdentityForOrigin(origin: string): Promise<IdentityRecord | null> {
   const identities = await vault.listIdentities();
   if (!identities.length) return null;
 
@@ -403,13 +520,16 @@ async function resolveIdentityForOrigin(origin: string) {
   return identities[0] ?? null;
 }
 
-async function resolveIdentityById(identityId: string | null) {
+async function resolveIdentityById(identityId: string | null): Promise<IdentityRecord | null> {
   if (!identityId) return null;
   const identities = await vault.listIdentities();
   return identities.find((identity) => identity.id === identityId) ?? null;
 }
 
-async function resolveApprovedIdentityId(requestedIdentityId: string | null, fallbackIdentityId: string | null) {
+async function resolveApprovedIdentityId(
+  requestedIdentityId: string | null,
+  fallbackIdentityId: string | null
+): Promise<string | null> {
   const requested = await resolveIdentityById(requestedIdentityId);
   if (requested) return requested.id;
 
@@ -425,13 +545,14 @@ async function resolveApprovedIdentityId(requestedIdentityId: string | null, fal
 
 async function enforceBackgroundLockPolicy() {
   let remember = true;
+
   try {
     const result = await browser.storage.local.get(REMEMBER_UNLOCK_KEY);
     if (typeof result[REMEMBER_UNLOCK_KEY] === "boolean") {
-      remember = result[REMEMBER_UNLOCK_KEY];
+      remember = result[REMEMBER_UNLOCK_KEY] as boolean;
     }
   } catch {
-    // ignore preference read errors
+    // Ignore preference read errors.
   }
 
   const unlocked = await vault.isUnlocked();
@@ -453,7 +574,7 @@ async function enforceBackgroundLockPolicy() {
   }
 }
 
-async function signEventWithIdentity(payload: any, identityId: string) {
+async function signEventWithIdentity(payload: SignEventPayload, identityId: string): Promise<SignedNostrEvent> {
   return vault.signEvent({
     kind: payload.kind,
     content: payload.content,
@@ -488,7 +609,7 @@ async function saveOriginProfiles(map: OriginProfileMap) {
   try {
     await browser.storage.local.set({ [ORIGIN_PROFILE_MAP_KEY]: map });
   } catch {
-    // ignore storage errors
+    // Ignore storage errors.
   }
 }
 
@@ -520,7 +641,7 @@ async function saveSignPolicies(policies: SignPolicyMap) {
   try {
     await browser.storage.local.set({ [SIGN_POLICY_MAP_KEY]: policies });
   } catch {
-    // ignore storage errors
+    // Ignore storage errors.
   }
 }
 
@@ -528,10 +649,7 @@ async function buildTrustedWebsiteEntries(): Promise<TrustedWebsiteEntry[]> {
   const signPolicies = await loadSignPolicies();
   const originProfiles = await loadOriginProfiles();
 
-  const allOrigins = new Set<string>([
-    ...Object.keys(signPolicies),
-    ...Object.keys(originProfiles),
-  ]);
+  const allOrigins = new Set<string>([...Object.keys(signPolicies), ...Object.keys(originProfiles)]);
 
   const entries: TrustedWebsiteEntry[] = [...allOrigins]
     .sort((a, b) => a.localeCompare(b))
@@ -575,54 +693,53 @@ function normalizeOrigin(rawOrigin: unknown): string | null {
   }
 }
 
-async function openApprovalWindow(): Promise<boolean> {
-  const approvalUrl = browser.runtime.getURL("index.html#sign-request");
-
-  if (approvalWindowId !== null) {
-    try {
-      await browser.windows.update(approvalWindowId, { focused: true });
-      return true;
-    } catch {
-      approvalWindowId = null;
-    }
-  }
-
-  try {
-    const created = await browser.windows.create({
-      url: approvalUrl,
-      type: "popup",
-      focused: true,
-      width: APPROVAL_WINDOW_WIDTH,
-      height: APPROVAL_WINDOW_HEIGHT,
-    });
-
-    approvalWindowId = created.id ?? null;
-    return true;
-  } catch (popupErr) {
-    console.warn("[Nostr Signer] Popup window creation failed, trying normal window fallback:", popupErr);
-    try {
-      const created = await browser.windows.create({
-        url: approvalUrl,
-        type: "normal",
-        focused: true,
-        width: APPROVAL_WINDOW_WIDTH,
-        height: APPROVAL_WINDOW_HEIGHT,
-      });
-      approvalWindowId = created.id ?? null;
-      return true;
-    } catch (windowErr) {
-      console.error("[Nostr Signer] Failed to open approval window:", windowErr);
-      await showNotification(
-        "Nostr Signer",
-        "Signature request pending. Click the extension icon to approve."
-      );
-      return false;
-    }
-  }
+function parseRequestOrigin(rawOrigin: unknown): string {
+  const normalized = normalizeOrigin(rawOrigin);
+  return normalized ?? "unknown";
 }
 
-browser.windows.onRemoved.addListener((windowId) => {
-  if (windowId === approvalWindowId) {
-    approvalWindowId = null;
-  }
-});
+function normalizeSignEventPayload(payload: unknown): SignEventPayload {
+  const source = toRecord(payload);
+
+  const kind = asFiniteNumber(source.kind) ?? 1;
+  const content = asString(source.content) || "";
+  const createdAtRaw = asFiniteNumber(source.created_at);
+  const createdAt = typeof createdAtRaw === "number" ? Math.trunc(createdAtRaw) : undefined;
+
+  const tagsSource = Array.isArray(source.tags) ? source.tags : [];
+  const tags = tagsSource
+    .filter((entry): entry is unknown[] => Array.isArray(entry))
+    .map((entry) => entry.map((item) => String(item)));
+
+  return {
+    kind,
+    content,
+    tags,
+    created_at: createdAt,
+  };
+}
+
+function toRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object") return {};
+  return value as Record<string, unknown>;
+}
+
+function asString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function asFiniteNumber(value: unknown): number | null {
+  if (typeof value !== "number") return null;
+  if (!Number.isFinite(value)) return null;
+  return value;
+}
+
+function toError(value: unknown, fallback: string): Error {
+  if (value instanceof Error) return value;
+  if (typeof value === "string" && value) return new Error(value);
+  return new Error(fallback);
+}
+
+function toErrorMessage(value: unknown, fallback: string): string {
+  return toError(value, fallback).message;
+}
