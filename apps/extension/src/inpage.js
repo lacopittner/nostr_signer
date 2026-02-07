@@ -3,19 +3,9 @@
 
 console.log("[Nostr Signer] Inpage script executing");
 
-interface NostrEvent {
-  id?: string;
-  pubkey?: string;
-  created_at: number;
-  kind: number;
-  tags: string[][];
-  content: string;
-  sig?: string;
-}
-
 (() => {
   // Prevent double injection
-  if ((window as any).nostr) {
+  if (window.nostr) {
     console.log("[Nostr Signer] Already injected, skipping");
     return;
   }
@@ -23,10 +13,8 @@ interface NostrEvent {
   console.log("[Nostr Signer] Injecting NIP-07 API...");
 
   let requestId = 0;
-  const pendingRequests = new Map<
-    number,
-    { resolve: (value: any) => void; reject: (reason: any) => void }
-  >();
+  const pendingRequests = new Map();
+  const supportedNips = [4, 44];
 
   // Listen for responses from content script
   window.addEventListener("message", (event) => {
@@ -46,7 +34,7 @@ interface NostrEvent {
   });
 
   // Send message to content script
-  function sendMessage(type: string, payload?: any): Promise<any> {
+  function sendMessage(type, payload) {
     return new Promise((resolve, reject) => {
       const id = ++requestId;
       pendingRequests.set(id, { resolve, reject });
@@ -72,56 +60,45 @@ interface NostrEvent {
 
   // NIP-07 API
   const nostr = {
+    _nips: supportedNips,
+    // Compatibility with older NIP-07 integrations (nos2x style)
+    enable: async () => nostr,
+    isEnabled: async () => true,
+
     /**
      * Get public key of the active identity
      */
-    getPublicKey: async (): Promise<string> => {
-      return sendMessage("GET_PUBLIC_KEY");
-    },
+    getPublicKey: async () => sendMessage("GET_PUBLIC_KEY"),
 
     /**
      * Sign a Nostr event
      */
-    signEvent: async (event: NostrEvent): Promise<NostrEvent> => {
-      return sendMessage("SIGN_EVENT", event);
-    },
+    signEvent: async (event) => sendMessage("SIGN_EVENT", event),
 
     /**
      * Get recommended relays
      */
-    getRelays: async (): Promise<Record<string, { read: boolean; write: boolean }>> => {
-      return sendMessage("GET_RELAYS");
-    },
+    getRelays: async () => sendMessage("GET_RELAYS"),
 
     /**
      * NIP-04 encryption
      */
     nip04: {
-      encrypt: async (pubkey: string, plaintext: string): Promise<string> => {
-        return sendMessage("NIP04_ENCRYPT", { pubkey, plaintext });
-      },
-
-      decrypt: async (pubkey: string, ciphertext: string): Promise<string> => {
-        return sendMessage("NIP04_DECRYPT", { pubkey, ciphertext });
-      },
+      encrypt: async (pubkey, plaintext) => sendMessage("NIP04_ENCRYPT", { pubkey, plaintext }),
+      decrypt: async (pubkey, ciphertext) => sendMessage("NIP04_DECRYPT", { pubkey, ciphertext }),
     },
 
     /**
      * NIP-44 encryption
      */
     nip44: {
-      encrypt: async (pubkey: string, plaintext: string): Promise<string> => {
-        return sendMessage("NIP44_ENCRYPT", { pubkey, plaintext });
-      },
-
-      decrypt: async (pubkey: string, ciphertext: string): Promise<string> => {
-        return sendMessage("NIP44_DECRYPT", { pubkey, ciphertext });
-      },
+      encrypt: async (pubkey, plaintext) => sendMessage("NIP44_ENCRYPT", { pubkey, plaintext }),
+      decrypt: async (pubkey, ciphertext) => sendMessage("NIP44_DECRYPT", { pubkey, ciphertext }),
     },
   };
 
   // Expose to window
-  (window as any).nostr = nostr;
+  window.nostr = nostr;
 
   // Dispatch event for apps listening
   window.dispatchEvent(new Event("nostr:ready"));

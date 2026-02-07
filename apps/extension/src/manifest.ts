@@ -9,7 +9,7 @@ const manifest: CrossBrowserManifest = {
     default_popup: "index.html",
     default_title: "Nostr Signer",
   },
-  permissions: ["storage", "alarms"],
+  permissions: ["storage", "alarms", "notifications"],
   host_permissions: ["https://*/*", "http://*/*"],
   background: {
     service_worker: "src/background.ts",
@@ -24,7 +24,7 @@ const manifest: CrossBrowserManifest = {
   ],
   web_accessible_resources: [
     {
-      resources: ["src/inpage.ts"],
+      resources: ["src/inpage.js"],
       matches: ["<all_urls>"],
       use_dynamic_url: true,
     },

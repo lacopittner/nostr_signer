@@ -76,6 +76,11 @@ export class IdentityVault {
     return !!this.state.pinHash;
   }
 
+  async reload(): Promise<void> {
+    this.loaded = false;
+    await this.ensureLoaded();
+  }
+
   async setPin(pin: string): Promise<void> {
     await this.ensureLoaded();
     const { hashPassword } = await import("./nostr");
@@ -256,7 +261,9 @@ export class IdentityVault {
   async signEvent(input: SignEventInput): Promise<SignedNostrEvent> {
     await this.ensureUnlocked();
 
-    const identity = await this.getActiveIdentity();
+    const identity = input.identityId
+      ? this.state.identities.find((item) => item.id === input.identityId) ?? null
+      : await this.getActiveIdentity();
     if (!identity) throw new Error("No active identity");
 
     const privateKey = await this.decryptWithMasterKey(identity.encryptedPrivateKey!);

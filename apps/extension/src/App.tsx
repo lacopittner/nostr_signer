@@ -7,51 +7,195 @@ type ThemeMode = "light" | "dark";
 const THEME_STORAGE_KEY = "nostr_signer_theme";
 const REMEMBER_UNLOCK_KEY = "nostr_signer_remember_unlock";
 const SESSION_UNLOCK_KEY = "nostr_signer_session_unlock";
+const DEFAULT_PROFILE_KEY = "nostr_signer_default_profile_id";
 const DEFAULT_UNLOCK_TTL_MS = 15 * 60 * 1000;
 const SESSION_UNLOCK_TTL_MS = 365 * 24 * 60 * 60 * 1000;
+
+type TrustedSignPolicyMode = "ask" | "always_allow" | "always_reject";
+type TrustedCapabilityState = "allow" | "ask" | "deny";
+
+interface TrustedCapability {
+  key: "get_public_key" | "sign_event";
+  label: string;
+  state: TrustedCapabilityState;
+}
+
+interface TrustedWebsiteEntry {
+  origin: string;
+  signPolicy: TrustedSignPolicyMode;
+  policyIdentityId: string | null;
+  boundProfileId: string | null;
+  capabilities: TrustedCapability[];
+}
+
+const CAPABILITY_STATE_LABEL: Record<TrustedCapabilityState, string> = {
+  allow: "Allowed",
+  ask: "Ask",
+  deny: "Blocked",
+};
+
+const KNOWN_KIND_LABELS: Record<number, string> = {
+  0: "Profile metadata update",
+  1: "Text note post",
+  3: "Follow list update",
+  4: "Encrypted direct message",
+  5: "Deletion request",
+  6: "Repost",
+  7: "Reaction",
+  40: "Channel creation",
+  41: "Channel metadata update",
+  42: "Channel message",
+  43: "Channel hide message",
+  44: "Channel mute user",
+  9734: "Zap request",
+  9735: "Zap receipt",
+  10002: "Relay list update",
+  30023: "Long-form article",
+};
+
+function describeEventKind(kind: unknown): string {
+  if (typeof kind !== "number" || !Number.isFinite(kind)) {
+    return "Unknown event type";
+  }
+  const direct = KNOWN_KIND_LABELS[kind];
+  if (direct) return direct;
+  if (kind >= 30000 && kind < 40000) return "Parameterized replaceable event";
+  if (kind >= 20000 && kind < 30000) return "Ephemeral event";
+  if (kind >= 10000 && kind < 20000) return "Replaceable event";
+  return "Custom event";
+}
 
 // Sign Request Confirmation Screen
 function SignRequestScreen({
   requestId,
   origin,
   event,
+  identities,
+  defaultProfileId,
+  initialProfileId,
+  autoApprove,
   onComplete,
 }: {
   requestId: string;
   origin: string;
   event: any;
+  identities: IdentityRecord[];
+  defaultProfileId: string | null;
+  initialProfileId: string | null;
+  autoApprove: boolean;
   onComplete: () => void;
 }) {
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [autoApproveAttempted, setAutoApproveAttempted] = useState(false);
+  const [selectedProfileId, setSelectedProfileId] = useState(
+    initialProfileId ?? defaultProfileId ?? identities[0]?.id ?? ""
+  );
 
-  const handleApprove = async () => {
+  useEffect(() => {
+    if (!identities.length) {
+      setSelectedProfileId("");
+      return;
+    }
+    const hasSelected = identities.some((identity) => identity.id === selectedProfileId);
+    if (!hasSelected) {
+      setSelectedProfileId(initialProfileId ?? defaultProfileId ?? identities[0]?.id ?? "");
+    }
+  }, [defaultProfileId, identities, initialProfileId, selectedProfileId]);
+
+  const completeAndClose = () => {
+    onComplete();
+    window.setTimeout(() => {
+      try {
+        window.close();
+      } catch {
+        // ignore close errors
+      }
+    }, 40);
+  };
+
+  const handleApprove = async (alwaysAllow: boolean) => {
+    if (!selectedProfileId) {
+      setError("Select profile for signing");
+      return;
+    }
     setLoading(true);
+    setError("");
     try {
       await browser.runtime.sendMessage({
         type: "APPROVE_REQUEST",
         requestId,
+        identityId: selectedProfileId,
+        alwaysAllow,
       });
-      onComplete();
+      completeAndClose();
     } catch (err) {
-      alert("Failed to sign: " + (err instanceof Error ? err.message : "Unknown error"));
+      setError(err instanceof Error ? err.message : "Failed to sign");
       setLoading(false);
     }
   };
 
-  const handleReject = async () => {
-    await browser.runtime.sendMessage({
-      type: "REJECT_REQUEST",
-      requestId,
-    });
-    onComplete();
+  const handleReject = async (alwaysReject: boolean) => {
+    setLoading(true);
+    setError("");
+    try {
+      await browser.runtime.sendMessage({
+        type: "REJECT_REQUEST",
+        requestId,
+        alwaysReject,
+      });
+      completeAndClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to reject");
+      setLoading(false);
+    }
   };
+
+  useEffect(() => {
+    if (!autoApprove || autoApproveAttempted || !selectedProfileId) return;
+    setAutoApproveAttempted(true);
+    void handleApprove(false);
+  }, [autoApprove, autoApproveAttempted, selectedProfileId]);
 
   return (
     <div style={{ padding: "20px", width: "500px", maxWidth: "100%" }}>
-      <h2 style={{ marginBottom: "8px" }}>Sign Request</h2>
+      <h2 style={{ marginBottom: "8px" }}>{autoApprove ? "Signing Request" : "Sign Request"}</h2>
       <p style={{ color: "var(--text-muted)", marginBottom: "20px", fontSize: "14px" }}>
-        <strong>{origin}</strong> wants to sign a Nostr event
+        {autoApprove ? (
+          <>
+            <strong>{origin}</strong> is allowed by policy. Signing after unlock.
+          </>
+        ) : (
+          <>
+            <strong>{origin}</strong> wants to sign a Nostr event
+          </>
+        )}
       </p>
+
+      <div style={{ marginBottom: "16px" }}>
+        <label style={{ display: "block", fontSize: "13px", marginBottom: "6px", color: "var(--text-muted)" }}>
+          Signing profile
+        </label>
+        <select
+          value={selectedProfileId}
+          onChange={(e) => setSelectedProfileId(e.target.value)}
+          style={{
+            width: "100%",
+            padding: "10px",
+            borderRadius: "6px",
+            border: "1px solid var(--border-muted)",
+            background: "var(--surface-elevated)",
+            color: "var(--text-primary)",
+          }}
+        >
+          {identities.map((identity) => (
+            <option key={identity.id} value={identity.id}>
+              {identity.label}
+              {identity.id === defaultProfileId ? " (Default)" : ""}
+            </option>
+          ))}
+        </select>
+      </div>
 
       <div
         style={{
@@ -63,7 +207,7 @@ function SignRequestScreen({
         }}
       >
         <div style={{ marginBottom: "8px" }}>
-          <strong>Kind:</strong> {event.kind}
+          <strong>Kind:</strong> {event.kind} - {describeEventKind(event.kind)}
         </div>
         <div style={{ marginBottom: "8px" }}>
           <strong>Content:</strong>
@@ -88,9 +232,13 @@ function SignRequestScreen({
         )}
       </div>
 
+      {error && <p style={{ color: "var(--danger)", marginBottom: "12px", fontSize: "13px" }}>{error}</p>}
+
       <div style={{ display: "flex", gap: "8px" }}>
         <button
-          onClick={handleReject}
+          onClick={() => {
+            void handleReject(false);
+          }}
           disabled={loading}
           style={{
             flex: 1,
@@ -106,7 +254,9 @@ function SignRequestScreen({
           Reject
         </button>
         <button
-          onClick={handleApprove}
+          onClick={() => {
+            void handleApprove(false);
+          }}
           disabled={loading}
           style={{
             flex: 1,
@@ -119,7 +269,48 @@ function SignRequestScreen({
             fontSize: "14px",
           }}
         >
-          {loading ? "Signing..." : "Approve"}
+          {loading ? "Signing..." : "Allow"}
+        </button>
+      </div>
+
+      <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
+        <button
+          onClick={() => {
+            void handleReject(true);
+          }}
+          disabled={loading}
+          style={{
+            flex: 1,
+            padding: "12px",
+            background: "transparent",
+            color: "var(--danger)",
+            border: "1px solid color-mix(in srgb, var(--danger) 65%, var(--border-muted))",
+            borderRadius: "8px",
+            cursor: "pointer",
+            fontSize: "13px",
+            fontWeight: 600,
+          }}
+        >
+          Always Reject
+        </button>
+        <button
+          onClick={() => {
+            void handleApprove(true);
+          }}
+          disabled={loading}
+          style={{
+            flex: 1,
+            padding: "12px",
+            background: "transparent",
+            color: "var(--active-text)",
+            border: "1px solid color-mix(in srgb, var(--active-text) 70%, var(--border-muted))",
+            borderRadius: "8px",
+            cursor: "pointer",
+            fontSize: "13px",
+            fontWeight: 600,
+          }}
+        >
+          Always Allow
         </button>
       </div>
     </div>
@@ -220,11 +411,22 @@ function PinLockScreen({
 }
 
 // PIN Setup Screen
-function PinSetupScreen({ onComplete }: { onComplete: () => void }) {
+function PinSetupScreen({
+  onComplete,
+  defaultRemember,
+}: {
+  onComplete: (pin: string, remember: boolean) => Promise<void>;
+  defaultRemember: boolean;
+}) {
   const [pin, setPin] = useState("");
   const [confirmPin, setConfirmPin] = useState("");
   const [step, setStep] = useState(1);
   const [error, setError] = useState("");
+  const [remember, setRemember] = useState(defaultRemember);
+
+  useEffect(() => {
+    setRemember(defaultRemember);
+  }, [defaultRemember]);
 
   const handleFirstStep = (e: React.FormEvent) => {
     e.preventDefault();
@@ -242,9 +444,7 @@ function PinSetupScreen({ onComplete }: { onComplete: () => void }) {
       setError("PINs do not match");
       return;
     }
-    await vault.setPin(pin);
-    await vault.unlock(pin);
-    onComplete();
+    await onComplete(pin, remember);
   };
 
   return (
@@ -275,6 +475,24 @@ function PinSetupScreen({ onComplete }: { onComplete: () => void }) {
               color: "var(--text-primary)",
             }}
           />
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              justifyContent: "center",
+              color: "var(--text-muted)",
+              fontSize: "13px",
+              marginBottom: "12px",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={remember}
+              onChange={(e) => setRemember(e.target.checked)}
+            />
+            Remember until browser closes
+          </label>
           {error && <p style={{ color: "var(--danger)", marginBottom: "12px" }}>{error}</p>}
           <button
             type="submit"
@@ -312,6 +530,24 @@ function PinSetupScreen({ onComplete }: { onComplete: () => void }) {
               color: "var(--text-primary)",
             }}
           />
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              justifyContent: "center",
+              color: "var(--text-muted)",
+              fontSize: "13px",
+              marginBottom: "12px",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={remember}
+              onChange={(e) => setRemember(e.target.checked)}
+            />
+            Remember until browser closes
+          </label>
           {error && <p style={{ color: "var(--danger)", marginBottom: "12px" }}>{error}</p>}
           <button
             type="submit"
@@ -352,6 +588,7 @@ function PinSetupScreen({ onComplete }: { onComplete: () => void }) {
 export default function App() {
   const [theme, setTheme] = useState<ThemeMode>("light");
   const [rememberUnlock, setRememberUnlock] = useState(true);
+  const [defaultProfileId, setDefaultProfileId] = useState<string | null>(null);
   const [identities, setIdentities] = useState<IdentityRecord[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [isLocked, setIsLocked] = useState(true);
@@ -363,6 +600,8 @@ export default function App() {
     id: string;
     origin: string;
     event: any;
+    selectedIdentityId: string | null;
+    autoApprove: boolean;
   } | null>(null);
   
   // Modals
@@ -379,6 +618,11 @@ export default function App() {
     revealed?: boolean;
   } | null>(null);
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
+  const [trustedSites, setTrustedSites] = useState<TrustedWebsiteEntry[]>([]);
+  const [trustedSiteDrafts, setTrustedSiteDrafts] = useState<
+    Record<string, { signPolicy: TrustedSignPolicyMode; policyIdentityId: string; boundProfileId: string }>
+  >({});
+  const [trustedSitesLoading, setTrustedSitesLoading] = useState(false);
   
   // Form states
   const [newLabel, setNewLabel] = useState("");
@@ -395,6 +639,96 @@ export default function App() {
   const showToast = useCallback((message: string, type: "success" | "error" = "success") => {
     setToast({ message, type });
   }, []);
+
+  const refreshTrustedSites = useCallback(async () => {
+    setTrustedSitesLoading(true);
+    try {
+      const response = await browser.runtime.sendMessage({ type: "GET_TRUSTED_WEBSITES" });
+      if (response?.error) {
+        throw new Error(response.error);
+      }
+
+      const entries: TrustedWebsiteEntry[] = Array.isArray(response?.entries)
+        ? (response.entries as any[]).map((entry) => {
+            const signPolicy: TrustedSignPolicyMode =
+              entry?.signPolicy === "always_allow" || entry?.signPolicy === "always_reject"
+                ? entry.signPolicy
+                : "ask";
+            const capabilityFallback: TrustedCapability[] = [
+              {
+                key: "get_public_key",
+                label: "Get public key",
+                state: "allow",
+              },
+              {
+                key: "sign_event",
+                label: "Sign events",
+                state:
+                  signPolicy === "always_allow"
+                    ? "allow"
+                    : signPolicy === "always_reject"
+                      ? "deny"
+                      : "ask",
+              },
+            ];
+
+            const capabilities = Array.isArray(entry?.capabilities)
+              ? (entry.capabilities as any[])
+                  .map((capability) => {
+                    const key =
+                      capability?.key === "sign_event" ? "sign_event" : "get_public_key";
+                    const state: TrustedCapabilityState =
+                      capability?.state === "allow" ||
+                      capability?.state === "ask" ||
+                      capability?.state === "deny"
+                        ? capability.state
+                        : "ask";
+                    return {
+                      key,
+                      label:
+                        typeof capability?.label === "string" && capability.label.trim()
+                          ? capability.label
+                          : key === "sign_event"
+                            ? "Sign events"
+                            : "Get public key",
+                      state,
+                    };
+                  })
+                  .filter(
+                    (capability, index, all) =>
+                      all.findIndex((item) => item.key === capability.key) === index
+                  )
+              : capabilityFallback;
+
+            return {
+              origin: String(entry?.origin ?? ""),
+              signPolicy,
+              policyIdentityId: typeof entry?.policyIdentityId === "string" ? entry.policyIdentityId : null,
+              boundProfileId: typeof entry?.boundProfileId === "string" ? entry.boundProfileId : null,
+              capabilities: capabilities.length ? capabilities : capabilityFallback,
+            };
+          })
+        : [];
+      setTrustedSites(entries);
+
+      const nextDrafts: Record<
+        string,
+        { signPolicy: TrustedSignPolicyMode; policyIdentityId: string; boundProfileId: string }
+      > = {};
+      entries.forEach((entry) => {
+        nextDrafts[entry.origin] = {
+          signPolicy: entry.signPolicy,
+          policyIdentityId: entry.policyIdentityId ?? "",
+          boundProfileId: entry.boundProfileId ?? "",
+        };
+      });
+      setTrustedSiteDrafts(nextDrafts);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Failed to load trusted websites", "error");
+    } finally {
+      setTrustedSitesLoading(false);
+    }
+  }, [showToast]);
 
   const toNpub = useCallback((pubkeyHex: string) => {
     try {
@@ -431,13 +765,20 @@ export default function App() {
     const init = async () => {
       let rememberPref = true;
       try {
-        const result = await browser.storage.local.get([THEME_STORAGE_KEY, REMEMBER_UNLOCK_KEY]);
+        const result = await browser.storage.local.get([
+          THEME_STORAGE_KEY,
+          REMEMBER_UNLOCK_KEY,
+          DEFAULT_PROFILE_KEY,
+        ]);
         const storedTheme = result[THEME_STORAGE_KEY];
         if (storedTheme === "light" || storedTheme === "dark") {
           setTheme(storedTheme);
         }
         if (typeof result[REMEMBER_UNLOCK_KEY] === "boolean") {
           rememberPref = result[REMEMBER_UNLOCK_KEY];
+        }
+        if (typeof result[DEFAULT_PROFILE_KEY] === "string") {
+          setDefaultProfileId(result[DEFAULT_PROFILE_KEY]);
         }
         setRememberUnlock(rememberPref);
       } catch {
@@ -450,21 +791,27 @@ export default function App() {
           "pendingRequestId",
           "pendingOrigin",
           "pendingEvent",
+          "pendingSelectedIdentityId",
+          "pendingAutoApprove",
         ]);
         if (session.pendingRequestId) {
           setPendingRequest({
             id: session.pendingRequestId,
             origin: session.pendingOrigin,
             event: session.pendingEvent,
+            selectedIdentityId:
+              typeof session.pendingSelectedIdentityId === "string"
+                ? session.pendingSelectedIdentityId
+                : null,
+            autoApprove: Boolean(session.pendingAutoApprove),
           });
-          // Clear from storage
           await browser.storage.session.remove([
             "pendingRequestId",
             "pendingOrigin",
             "pendingEvent",
+            "pendingSelectedIdentityId",
+            "pendingAutoApprove",
           ]);
-          setIsLoading(false);
-          return;
         }
       } catch {
         // Session storage not available
@@ -475,30 +822,49 @@ export default function App() {
       
       if (pinSet) {
         let unlocked = await vault.isUnlocked();
-        if (unlocked && rememberPref) {
-          try {
-            const session = await browser.storage.session.get(SESSION_UNLOCK_KEY);
-            const sessionAllowed = Boolean(session[SESSION_UNLOCK_KEY]);
-            if (!sessionAllowed) {
+        if (unlocked) {
+          if (!rememberPref) {
+            await vault.lock();
+            try {
+              await browser.runtime.sendMessage({ type: "LOCK_VAULT" });
+            } catch {
+              // ignore background sync errors
+            }
+            unlocked = false;
+          } else {
+            try {
+              const session = await browser.storage.session.get(SESSION_UNLOCK_KEY);
+              const sessionAllowed = Boolean(session[SESSION_UNLOCK_KEY]);
+              if (!sessionAllowed) {
+                await vault.lock();
+                try {
+                  await browser.runtime.sendMessage({ type: "LOCK_VAULT" });
+                } catch {
+                  // ignore background sync errors
+                }
+                unlocked = false;
+              }
+            } catch {
               await vault.lock();
+              try {
+                await browser.runtime.sendMessage({ type: "LOCK_VAULT" });
+              } catch {
+                // ignore background sync errors
+              }
               unlocked = false;
             }
-          } catch {
-            await vault.lock();
-            unlocked = false;
           }
         }
 
         setIsLocked(!unlocked);
-        if (unlocked) {
-          await refresh();
-        }
+        await refresh();
+        await refreshTrustedSites();
       }
       
       setIsLoading(false);
     };
     void init();
-  }, [refresh]);
+  }, [refresh, refreshTrustedSites]);
 
   const handleToggleTheme = async () => {
     const nextTheme: ThemeMode = theme === "light" ? "dark" : "light";
@@ -514,6 +880,15 @@ export default function App() {
     const ttl = remember ? SESSION_UNLOCK_TTL_MS : DEFAULT_UNLOCK_TTL_MS;
     const success = await vault.unlock(pin, ttl);
     if (!success) return false;
+    try {
+      const response = await browser.runtime.sendMessage({ type: "UNLOCK_VAULT", pin, ttlMs: ttl });
+      if (response?.error) {
+        throw new Error(response.error);
+      }
+    } catch {
+      await vault.lock();
+      return false;
+    }
 
     setRememberUnlock(remember);
     try {
@@ -529,17 +904,58 @@ export default function App() {
 
     setIsLocked(false);
     await refresh();
+    await refreshTrustedSites();
     return true;
   };
 
-  const handleSetupComplete = async () => {
+  const handleSetupComplete = async (pin: string, remember: boolean) => {
+    await vault.setPin(pin);
+    const ttl = remember ? SESSION_UNLOCK_TTL_MS : DEFAULT_UNLOCK_TTL_MS;
+    const success = await vault.unlock(pin, ttl);
+    if (!success) {
+      setHasPin(true);
+      setIsLocked(true);
+      showToast("Failed to unlock after setup", "error");
+      return;
+    }
+    try {
+      const response = await browser.runtime.sendMessage({ type: "UNLOCK_VAULT", pin, ttlMs: ttl });
+      if (response?.error) {
+        throw new Error(response.error);
+      }
+    } catch {
+      await vault.lock();
+      setHasPin(true);
+      setIsLocked(true);
+      showToast("Failed to sync unlock state", "error");
+      return;
+    }
+
+    setRememberUnlock(remember);
+    try {
+      await browser.storage.local.set({ [REMEMBER_UNLOCK_KEY]: remember });
+      if (remember) {
+        await browser.storage.session.set({ [SESSION_UNLOCK_KEY]: true });
+      } else {
+        await browser.storage.session.remove(SESSION_UNLOCK_KEY);
+      }
+    } catch {
+      // Ignore preference save errors
+    }
+
     setHasPin(true);
     setIsLocked(false);
     await refresh();
+    await refreshTrustedSites();
   };
 
   const handleLock = async () => {
     await vault.lock();
+    try {
+      await browser.runtime.sendMessage({ type: "LOCK_VAULT" });
+    } catch {
+      // Ignore background sync errors
+    }
     try {
       await browser.storage.session.remove(SESSION_UNLOCK_KEY);
     } catch {
@@ -644,6 +1060,127 @@ export default function App() {
     }
   };
 
+  const handleSetDefaultProfile = async (id: string) => {
+    setDefaultProfileId(id);
+    try {
+      await browser.storage.local.set({ [DEFAULT_PROFILE_KEY]: id });
+      showToast("Default profile updated");
+    } catch {
+      showToast("Failed to update default profile", "error");
+    }
+  };
+
+  const updateTrustedSiteDraft = useCallback(
+    (
+      origin: string,
+      updates: Partial<{ signPolicy: TrustedSignPolicyMode; policyIdentityId: string; boundProfileId: string }>
+    ) => {
+      setTrustedSiteDrafts((prev) => {
+        const current = prev[origin] ?? { signPolicy: "ask", policyIdentityId: "", boundProfileId: "" };
+        return {
+          ...prev,
+          [origin]: {
+            ...current,
+            ...updates,
+          },
+        };
+      });
+    },
+    []
+  );
+
+  const resolveDefaultProfileForPolicy = useCallback(() => {
+    return defaultProfileId ?? activeId ?? identities[0]?.id ?? "";
+  }, [activeId, defaultProfileId, identities]);
+
+  const handleSaveTrustedWebsite = useCallback(
+    async (origin: string) => {
+      const draft = trustedSiteDrafts[origin];
+      if (!draft) return;
+
+      const payload: {
+        origin: string;
+        signPolicy: TrustedSignPolicyMode;
+        policyIdentityId: string | null;
+        boundProfileId: string | null;
+      } = {
+        origin,
+        signPolicy: draft.signPolicy,
+        policyIdentityId: draft.policyIdentityId || null,
+        boundProfileId: draft.boundProfileId || null,
+      };
+
+      if (payload.signPolicy === "always_allow" && !payload.policyIdentityId) {
+        payload.policyIdentityId = payload.boundProfileId || resolveDefaultProfileForPolicy() || null;
+      }
+
+      try {
+        const response = await browser.runtime.sendMessage({
+          type: "UPDATE_TRUSTED_WEBSITE",
+          payload,
+        });
+        if (response?.error) {
+          throw new Error(response.error);
+        }
+        showToast("Trusted website updated");
+        await refreshTrustedSites();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : "Failed to update trusted website", "error");
+      }
+    },
+    [refreshTrustedSites, resolveDefaultProfileForPolicy, showToast, trustedSiteDrafts]
+  );
+
+  const handleRemoveTrustedWebsite = useCallback(
+    async (origin: string) => {
+      try {
+        const response = await browser.runtime.sendMessage({
+          type: "REMOVE_TRUSTED_WEBSITE",
+          payload: { origin },
+        });
+        if (response?.error) {
+          throw new Error(response.error);
+        }
+        showToast("Website removed");
+        await refreshTrustedSites();
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : "Failed to remove trusted website", "error");
+      }
+    },
+    [refreshTrustedSites, showToast]
+  );
+
+  useEffect(() => {
+    const ensureDefaultProfile = async () => {
+      if (identities.length === 0) {
+        if (defaultProfileId !== null) {
+          setDefaultProfileId(null);
+          try {
+            await browser.storage.local.remove(DEFAULT_PROFILE_KEY);
+          } catch {
+            // ignore storage errors
+          }
+        }
+        return;
+      }
+
+      const validDefault = defaultProfileId && identities.some((identity) => identity.id === defaultProfileId);
+      if (validDefault) return;
+
+      const fallback = identities[0]?.id ?? null;
+      if (!fallback) return;
+
+      setDefaultProfileId(fallback);
+      try {
+        await browser.storage.local.set({ [DEFAULT_PROFILE_KEY]: fallback });
+      } catch {
+        // ignore storage errors
+      }
+    };
+
+    void ensureDefaultProfile();
+  }, [defaultProfileId, identities]);
+
   const handleSign = async () => {
     try {
       const signed = await vault.signEvent({
@@ -661,27 +1198,32 @@ export default function App() {
     return <div style={{ padding: 40, textAlign: "center" }}>Loading...</div>;
   }
 
-  // Show sign request confirmation first
+  if (!hasPin) {
+    return <PinSetupScreen onComplete={handleSetupComplete} defaultRemember={rememberUnlock} />;
+  }
+
+  if (isLocked) {
+    return <PinLockScreen onUnlock={handleUnlock} defaultRemember={rememberUnlock} />;
+  }
+
+  // Show sign request confirmation first after unlock
   if (pendingRequest) {
     return (
       <SignRequestScreen
         requestId={pendingRequest.id}
         origin={pendingRequest.origin}
         event={pendingRequest.event}
+        identities={identities}
+        defaultProfileId={defaultProfileId}
+        initialProfileId={pendingRequest.selectedIdentityId}
+        autoApprove={pendingRequest.autoApprove}
         onComplete={() => {
           setPendingRequest(null);
-          refresh();
+          void refresh();
+          void refreshTrustedSites();
         }}
       />
     );
-  }
-
-  if (!hasPin) {
-    return <PinSetupScreen onComplete={handleSetupComplete} />;
-  }
-
-  if (isLocked) {
-    return <PinLockScreen onUnlock={handleUnlock} defaultRemember={rememberUnlock} />;
   }
 
   return (
@@ -781,11 +1323,37 @@ export default function App() {
             style={{
               padding: "12px",
               borderRadius: "8px",
-              border: id.id === activeId ? "2px solid var(--accent)" : "1px solid var(--border-muted)",
+              border:
+                id.id === activeId || id.id === defaultProfileId
+                  ? "2px solid var(--accent)"
+                  : "1px solid var(--border-muted)",
               background: id.id === activeId ? "var(--card-active-bg)" : "var(--card-bg)",
             }}
           >
             <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", minWidth: "54px" }}>
+                <button
+                  onClick={() => {
+                    void handleSetDefaultProfile(id.id);
+                  }}
+                  title={id.id === defaultProfileId ? "Default profile" : "Set as default profile"}
+                  aria-label={id.id === defaultProfileId ? "Default profile" : "Set default profile"}
+                  style={{
+                    padding: "4px 8px",
+                    borderRadius: "999px",
+                    fontSize: "11px",
+                    border: "1px solid var(--border-muted)",
+                    background:
+                      id.id === defaultProfileId ? "var(--surface-soft)" : "transparent",
+                    color: "var(--text-primary)",
+                    cursor: "pointer",
+                    fontWeight: 600,
+                  }}
+                >
+                  {id.id === defaultProfileId ? "Default" : "Set"}
+                </button>
+              </div>
+
               <div
                 style={{
                   width: "36px",
@@ -925,6 +1493,248 @@ export default function App() {
           ✍️ Sign Test Event
         </button>
       )}
+
+      {/* Trusted Websites */}
+      <div
+        style={{
+          marginTop: "20px",
+          border: "1px solid var(--border-muted)",
+          borderRadius: "10px",
+          padding: "12px",
+          background: "var(--surface-elevated)",
+        }}
+      >
+        <h3 style={{ margin: "0 0 10px 0", fontSize: "15px" }}>Trusted Websites</h3>
+        <p style={{ margin: "0 0 10px 0", color: "var(--text-muted)", fontSize: "12px" }}>
+          Websites appear here automatically after you choose Always Allow or Always Reject.
+        </p>
+
+        {trustedSitesLoading ? (
+          <p style={{ margin: 0, color: "var(--text-muted)", fontSize: "13px" }}>Loading trusted websites...</p>
+        ) : trustedSites.length === 0 ? (
+          <p style={{ margin: 0, color: "var(--text-muted)", fontSize: "13px" }}>
+            No trusted websites yet.
+          </p>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+            {trustedSites.map((site) => {
+              const draft = trustedSiteDrafts[site.origin] ?? {
+                signPolicy: site.signPolicy,
+                policyIdentityId: site.policyIdentityId ?? "",
+                boundProfileId: site.boundProfileId ?? "",
+              };
+              const displayedCapabilities: TrustedCapability[] = (
+                site.capabilities.length
+                  ? site.capabilities
+                  : [
+                      { key: "get_public_key", label: "Get public key", state: "allow" },
+                      {
+                        key: "sign_event",
+                        label: "Sign events",
+                        state:
+                          site.signPolicy === "always_allow"
+                            ? "allow"
+                            : site.signPolicy === "always_reject"
+                              ? "deny"
+                              : "ask",
+                      },
+                    ]
+              ).map((capability) =>
+                capability.key === "sign_event"
+                  ? {
+                      ...capability,
+                      state:
+                        draft.signPolicy === "always_allow"
+                          ? "allow"
+                          : draft.signPolicy === "always_reject"
+                            ? "deny"
+                            : "ask",
+                    }
+                  : capability
+              );
+
+              return (
+                <div
+                  key={site.origin}
+                  style={{
+                    border: "1px solid var(--border-muted)",
+                    borderRadius: "8px",
+                    padding: "10px",
+                    background: "var(--surface-muted)",
+                  }}
+                >
+                  <div
+                    style={{
+                      fontFamily: "monospace",
+                      fontSize: "12px",
+                      color: "var(--text-primary)",
+                      marginBottom: "8px",
+                      wordBreak: "break-all",
+                    }}
+                  >
+                    {site.origin}
+                  </div>
+
+                  <div style={{ marginBottom: "8px" }}>
+                    <div style={{ fontSize: "11px", color: "var(--text-muted)", marginBottom: "4px" }}>
+                      Enabled functionality
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+                      {displayedCapabilities.map((capability) => (
+                        <span
+                          key={`${site.origin}-${capability.key}`}
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "4px",
+                            fontSize: "11px",
+                            borderRadius: "999px",
+                            padding: "4px 8px",
+                            border: "1px solid var(--border-muted)",
+                            background:
+                              capability.state === "allow"
+                                ? "color-mix(in srgb, var(--active-text) 12%, transparent)"
+                                : capability.state === "deny"
+                                  ? "color-mix(in srgb, var(--danger) 12%, transparent)"
+                                  : "var(--surface-soft)",
+                            color:
+                              capability.state === "allow"
+                                ? "var(--active-text)"
+                                : capability.state === "deny"
+                                  ? "var(--danger)"
+                                  : "var(--text-muted)",
+                          }}
+                        >
+                          <strong style={{ fontWeight: 600 }}>{capability.label}</strong>
+                          <span>{CAPABILITY_STATE_LABEL[capability.state]}</span>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
+                    <label style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+                      Sign events
+                      <select
+                        value={draft.signPolicy}
+                        onChange={(e) =>
+                          updateTrustedSiteDraft(site.origin, {
+                            signPolicy: e.target.value as TrustedSignPolicyMode,
+                          })
+                        }
+                        style={{
+                          width: "100%",
+                          marginTop: "4px",
+                          padding: "8px",
+                          borderRadius: "6px",
+                          border: "1px solid var(--border-muted)",
+                          background: "var(--surface-elevated)",
+                          color: "var(--text-primary)",
+                        }}
+                      >
+                        <option value="ask">Ask every time</option>
+                        <option value="always_allow">Always allow</option>
+                        <option value="always_reject">Always reject</option>
+                      </select>
+                    </label>
+
+                    <label style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+                      Always allow profile
+                      <select
+                        value={draft.policyIdentityId}
+                        onChange={(e) =>
+                          updateTrustedSiteDraft(site.origin, {
+                            policyIdentityId: e.target.value,
+                          })
+                        }
+                        style={{
+                          width: "100%",
+                          marginTop: "4px",
+                          padding: "8px",
+                          borderRadius: "6px",
+                          border: "1px solid var(--border-muted)",
+                          background: "var(--surface-elevated)",
+                          color: "var(--text-primary)",
+                        }}
+                      >
+                        <option value="">Use site/default profile</option>
+                        {identities.map((identity) => (
+                          <option key={identity.id} value={identity.id}>
+                            {identity.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label style={{ fontSize: "12px", color: "var(--text-muted)", gridColumn: "1 / span 2" }}>
+                      Site profile (used by public key and default site actions)
+                      <select
+                        value={draft.boundProfileId}
+                        onChange={(e) =>
+                          updateTrustedSiteDraft(site.origin, {
+                            boundProfileId: e.target.value,
+                          })
+                        }
+                        style={{
+                          width: "100%",
+                          marginTop: "4px",
+                          padding: "8px",
+                          borderRadius: "6px",
+                          border: "1px solid var(--border-muted)",
+                          background: "var(--surface-elevated)",
+                          color: "var(--text-primary)",
+                        }}
+                      >
+                        <option value="">Use global default profile</option>
+                        {identities.map((identity) => (
+                          <option key={identity.id} value={identity.id}>
+                            {identity.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+
+                  <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
+                    <button
+                      onClick={() => {
+                        void handleSaveTrustedWebsite(site.origin);
+                      }}
+                      style={{
+                        flex: 1,
+                        padding: "9px 10px",
+                        background: "var(--primary-action-bg)",
+                        color: "var(--primary-action-text)",
+                        border: "none",
+                        borderRadius: "6px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Save
+                    </button>
+                    <button
+                      onClick={() => {
+                        void handleRemoveTrustedWebsite(site.origin);
+                      }}
+                      style={{
+                        flex: 1,
+                        padding: "9px 10px",
+                        background: "var(--surface-soft)",
+                        color: "var(--text-primary)",
+                        border: "1px solid var(--border-muted)",
+                        borderRadius: "6px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Forget
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
 
       {/* Create Modal */}
       {showCreate && (

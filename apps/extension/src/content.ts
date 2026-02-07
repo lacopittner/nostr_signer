@@ -12,6 +12,29 @@ const NOSTR_REQUEST_TYPES = new Set([
   "NOSTR_NIP44_ENCRYPT",
   "NOSTR_NIP44_DECRYPT",
 ]);
+const INVALIDATION_RELOAD_KEY = "nostr_signer_reload_after_invalidation";
+
+function isContextInvalidatedMessage(message: string | undefined) {
+  if (!message) return false;
+  return message.toLowerCase().includes("context invalidated");
+}
+
+function handleInvalidatedContext(message: string) {
+  try {
+    const alreadyReloaded = window.sessionStorage.getItem(INVALIDATION_RELOAD_KEY) === "1";
+    if (!alreadyReloaded) {
+      window.sessionStorage.setItem(INVALIDATION_RELOAD_KEY, "1");
+      console.warn("[Nostr Signer] Extension context invalidated, reloading page once...");
+      window.setTimeout(() => {
+        window.location.reload();
+      }, 80);
+      return { error: "Extension was updated. Reloading page..." };
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return { error: message || "Extension context invalidated. Please refresh this page." };
+}
 
 function injectInpageScript() {
   console.log("[Nostr Signer] Starting injection...");
@@ -22,7 +45,7 @@ function injectInpageScript() {
 
   const script = document.createElement("script");
   script.id = "nostr-signer-inpage";
-  script.src = chrome.runtime.getURL("src/inpage.ts");
+  script.src = chrome.runtime.getURL("src/inpage.js");
   script.async = false;
   script.onload = () => {
     script.remove();
@@ -64,8 +87,9 @@ window.addEventListener("message", async (event) => {
   const sendToBackground = (): Promise<any> => {
     return new Promise((resolve) => {
       try {
-        if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) {
-          throw new Error("Extension context invalidated");
+        if (typeof chrome === "undefined" || !chrome.runtime?.sendMessage) {
+          resolve(handleInvalidatedContext("Extension context invalidated"));
+          return;
         }
 
         chrome.runtime.sendMessage(
@@ -78,16 +102,31 @@ window.addEventListener("message", async (event) => {
           (response: any) => {
             // Check for runtime error (context invalidated)
             if (chrome.runtime.lastError) {
-              console.error("[Nostr Signer] Runtime error:", chrome.runtime.lastError);
-              resolve({ error: chrome.runtime.lastError.message || "Extension context invalidated" });
+              const runtimeMessage = chrome.runtime.lastError.message || "Extension context invalidated";
+              console.error("[Nostr Signer] Runtime error:", runtimeMessage);
+              if (isContextInvalidatedMessage(runtimeMessage)) {
+                resolve(handleInvalidatedContext(runtimeMessage));
+                return;
+              }
+              resolve({ error: runtimeMessage });
             } else {
+              try {
+                window.sessionStorage.removeItem(INVALIDATION_RELOAD_KEY);
+              } catch {
+                // ignore storage errors
+              }
               resolve(response);
             }
           }
         );
       } catch (error) {
         console.error("[Nostr Signer] Send error:", error);
-        resolve({ error: error instanceof Error ? error.message : "Failed to send message" });
+        const errorMessage = error instanceof Error ? error.message : "Failed to send message";
+        if (isContextInvalidatedMessage(errorMessage)) {
+          resolve(handleInvalidatedContext(errorMessage));
+          return;
+        }
+        resolve({ error: errorMessage });
       }
     });
   };
