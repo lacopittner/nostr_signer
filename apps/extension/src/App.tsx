@@ -626,6 +626,7 @@ export default function App() {
   // Modals
   const [showCreate, setShowCreate] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  const [showChangePin, setShowChangePin] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [copyDialog, setCopyDialog] = useState<{
@@ -647,6 +648,12 @@ export default function App() {
   const [newLabel, setNewLabel] = useState("");
   const [importKey, setImportKey] = useState("");
   const [editLabel, setEditLabel] = useState("");
+  const [currentPinInput, setCurrentPinInput] = useState("");
+  const [nextPinInput, setNextPinInput] = useState("");
+  const [confirmNextPinInput, setConfirmNextPinInput] = useState("");
+  const [changePinRemember, setChangePinRemember] = useState(true);
+  const [changePinError, setChangePinError] = useState("");
+  const [changePinLoading, setChangePinLoading] = useState(false);
 
   const refresh = useCallback(async () => {
     const list = await vault.listIdentities();
@@ -1035,6 +1042,84 @@ export default function App() {
     setIsLocked(true);
   };
 
+  const openChangePinModal = () => {
+    setCurrentPinInput("");
+    setNextPinInput("");
+    setConfirmNextPinInput("");
+    setChangePinError("");
+    setChangePinLoading(false);
+    setChangePinRemember(rememberUnlock);
+    setShowChangePin(true);
+  };
+
+  const closeChangePinModal = () => {
+    setShowChangePin(false);
+    setCurrentPinInput("");
+    setNextPinInput("");
+    setConfirmNextPinInput("");
+    setChangePinError("");
+    setChangePinLoading(false);
+  };
+
+  const handleChangePin = async () => {
+    if (changePinLoading) return;
+    if (!currentPinInput || !nextPinInput || !confirmNextPinInput) {
+      setChangePinError("Fill in all PIN fields");
+      return;
+    }
+    if (nextPinInput.length < 4) {
+      setChangePinError("New PIN must be at least 4 characters");
+      return;
+    }
+    if (nextPinInput !== confirmNextPinInput) {
+      setChangePinError("New PINs do not match");
+      return;
+    }
+
+    setChangePinLoading(true);
+    setChangePinError("");
+
+    try {
+      const changed = await vault.changePin(currentPinInput, nextPinInput);
+      if (!changed) {
+        throw new Error("Current PIN is incorrect");
+      }
+
+      const ttl = changePinRemember ? SESSION_UNLOCK_TTL_MS : DEFAULT_UNLOCK_TTL_MS;
+      const unlocked = await vault.unlock(nextPinInput, ttl);
+      if (!unlocked) {
+        throw new Error("Failed to unlock with new PIN");
+      }
+
+      const response = await browser.runtime.sendMessage({ type: "UNLOCK_VAULT", pin: nextPinInput, ttlMs: ttl });
+      if (response?.error) {
+        throw new Error(response.error);
+      }
+
+      setRememberUnlock(changePinRemember);
+      try {
+        await browser.storage.local.set({
+          [REMEMBER_UNLOCK_KEY]: changePinRemember,
+          [LOCKED_STATE_KEY]: false,
+        });
+        if (changePinRemember) {
+          await browser.storage.session.set({ [SESSION_UNLOCK_KEY]: true });
+        } else {
+          await browser.storage.session.remove(SESSION_UNLOCK_KEY);
+        }
+      } catch {
+        // Ignore preference save errors
+      }
+
+      setIsLocked(false);
+      closeChangePinModal();
+      showToast("PIN updated");
+    } catch (err) {
+      setChangePinError(err instanceof Error ? err.message : "Failed to change PIN");
+      setChangePinLoading(false);
+    }
+  };
+
   const handleCreate = async () => {
     if (!newLabel.trim()) return;
     
@@ -1334,6 +1419,22 @@ export default function App() {
             {theme === "light" ? "🌙 Dark" : "☀️ Light"}
           </button>
           <button
+            onClick={openChangePinModal}
+            style={{
+              padding: "8px 12px",
+              background: "var(--surface-soft)",
+              color: "var(--text-primary)",
+              border: "1px solid var(--border-muted)",
+              borderRadius: "6px",
+              cursor: "pointer",
+              fontSize: "12px",
+              fontWeight: 600,
+            }}
+            title="Change PIN"
+          >
+            🔐 PIN
+          </button>
+          <button
             onClick={handleLock}
             style={{
               padding: "8px 16px",
@@ -1567,32 +1668,6 @@ export default function App() {
                 signPolicy: site.signPolicy,
                 boundProfileId: site.boundProfileId ?? "",
               };
-              const publicKeyStatusLabel =
-                draft.getPublicKeyPolicy === "always_allow"
-                  ? "Always allow"
-                  : draft.getPublicKeyPolicy === "always_reject"
-                    ? "Always reject"
-                    : "Ask every time";
-              const publicKeyStatusColor =
-                draft.getPublicKeyPolicy === "always_allow"
-                  ? "var(--active-text)"
-                  : draft.getPublicKeyPolicy === "always_reject"
-                    ? "var(--danger)"
-                    : "var(--text-muted)";
-              const signingStatusLabel =
-                draft.signPolicy === "always_allow"
-                  ? "Always allow"
-                  : draft.signPolicy === "always_reject"
-                    ? "Always reject"
-                    : "Ask every time";
-              const signingStatusColor =
-                draft.signPolicy === "always_allow"
-                  ? "var(--active-text)"
-                  : draft.signPolicy === "always_reject"
-                    ? "var(--danger)"
-                    : "var(--text-muted)";
-              const siteProfileLabel =
-                identities.find((identity) => identity.id === draft.boundProfileId)?.label ?? "Global default";
 
               return (
                 <div
@@ -1604,7 +1679,7 @@ export default function App() {
                     background: "var(--surface-muted)",
                   }}
                 >
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: "10px", marginBottom: "8px" }}>
+                  <div style={{ marginBottom: "8px" }}>
                     <div
                       style={{
                         fontFamily: "monospace",
@@ -1615,37 +1690,6 @@ export default function App() {
                     >
                       {site.origin}
                     </div>
-                    <span
-                      style={{
-                        whiteSpace: "nowrap",
-                        fontSize: "11px",
-                        padding: "3px 8px",
-                        borderRadius: "999px",
-                        border: "1px solid var(--border-muted)",
-                        background: "var(--surface-soft)",
-                        color: signingStatusColor,
-                        height: "fit-content",
-                      }}
-                    >
-                      {signingStatusLabel}
-                    </span>
-                  </div>
-
-                  <div
-                    style={{
-                      display: "grid",
-                      gridTemplateColumns: "auto 1fr",
-                      gap: "4px 8px",
-                      fontSize: "12px",
-                      marginBottom: "10px",
-                    }}
-                  >
-                    <span style={{ color: "var(--text-muted)" }}>Public key:</span>
-                    <span style={{ color: publicKeyStatusColor }}>{publicKeyStatusLabel}</span>
-                    <span style={{ color: "var(--text-muted)" }}>Sign events:</span>
-                    <span style={{ color: signingStatusColor }}>{signingStatusLabel}</span>
-                    <span style={{ color: "var(--text-muted)" }}>Site profile:</span>
-                    <span style={{ color: "var(--text-primary)" }}>{siteProfileLabel}</span>
                   </div>
 
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
@@ -1881,6 +1925,83 @@ export default function App() {
               </button>
               <button
                 onClick={() => { setEditingId(null); setEditLabel(""); }}
+                style={{ flex: 1, padding: "10px", background: "var(--surface-soft)", color: "var(--text-primary)", border: "1px solid var(--border-muted)", borderRadius: "6px", cursor: "pointer" }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Change PIN Modal */}
+      {showChangePin && (
+        <div style={{
+          position: "fixed",
+          top: 0, left: 0, right: 0, bottom: 0,
+          background: "var(--overlay)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 100,
+        }}>
+          <div style={{ background: "var(--modal-bg)", color: "var(--modal-text)", padding: "20px", borderRadius: "12px", width: "320px", border: "1px solid var(--border-muted)" }}>
+            <h3>Change PIN</h3>
+            <input
+              type="password"
+              placeholder="Current PIN"
+              value={currentPinInput}
+              onChange={(e) => setCurrentPinInput(e.target.value)}
+              style={{ width: "100%", padding: "10px", marginBottom: "8px", borderRadius: "6px", border: "1px solid var(--border-muted)", background: "var(--surface-elevated)", color: "var(--text-primary)" }}
+              autoFocus
+            />
+            <input
+              type="password"
+              placeholder="New PIN"
+              value={nextPinInput}
+              onChange={(e) => setNextPinInput(e.target.value)}
+              style={{ width: "100%", padding: "10px", marginBottom: "8px", borderRadius: "6px", border: "1px solid var(--border-muted)", background: "var(--surface-elevated)", color: "var(--text-primary)" }}
+            />
+            <input
+              type="password"
+              placeholder="Confirm new PIN"
+              value={confirmNextPinInput}
+              onChange={(e) => setConfirmNextPinInput(e.target.value)}
+              style={{ width: "100%", padding: "10px", marginBottom: "10px", borderRadius: "6px", border: "1px solid var(--border-muted)", background: "var(--surface-elevated)", color: "var(--text-primary)" }}
+            />
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                color: "var(--text-muted)",
+                fontSize: "13px",
+                marginBottom: "10px",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={changePinRemember}
+                onChange={(e) => setChangePinRemember(e.target.checked)}
+              />
+              Remember until browser closes
+            </label>
+            {changePinError && (
+              <p style={{ color: "var(--danger)", margin: "0 0 10px 0", fontSize: "13px" }}>{changePinError}</p>
+            )}
+            <div style={{ display: "flex", gap: "8px" }}>
+              <button
+                onClick={() => {
+                  void handleChangePin();
+                }}
+                disabled={changePinLoading}
+                style={{ flex: 1, padding: "10px", background: "var(--primary-action-bg)", color: "var(--primary-action-text)", border: "none", borderRadius: "6px", cursor: "pointer" }}
+              >
+                {changePinLoading ? "Saving..." : "Save"}
+              </button>
+              <button
+                onClick={closeChangePinModal}
+                disabled={changePinLoading}
                 style={{ flex: 1, padding: "10px", background: "var(--surface-soft)", color: "var(--text-primary)", border: "1px solid var(--border-muted)", borderRadius: "6px", cursor: "pointer" }}
               >
                 Cancel

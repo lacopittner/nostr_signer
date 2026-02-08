@@ -10,7 +10,7 @@ const REMEMBER_UNLOCK_KEY = "nostr_signer_remember_unlock";
 const SESSION_UNLOCK_KEY = "nostr_signer_session_unlock";
 const LOCKED_STATE_KEY = "nostr_signer_locked";
 const APPROVAL_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
-const PUBLIC_KEY_ALLOW_BURST_MS = 15_000;
+const ONE_TIME_ALLOW_GRACE_MS = 3_000;
 
 const DEFAULT_RELAYS: Record<string, { read: boolean; write: boolean }> = {
   "wss://relay.damus.io": { read: true, write: true },
@@ -82,7 +82,11 @@ const pendingPublicKeyJoiners = new Map<
   string,
   Array<{ resolve: (value: string) => void; reject: (reason: Error) => void }>
 >();
-const recentPublicKeyApprovals = new Map<string, number>();
+const pendingSignJoiners = new Map<
+  string,
+  Array<{ resolve: (value: SignedNostrEvent) => void; reject: (reason: Error) => void }>
+>();
+const oneTimeAllowances = new Map<string, { expiresAt: number; remaining: number }>();
 let approvalSurfaceOpening: Promise<boolean> | null = null;
 
 browser.runtime.onInstalled.addListener(() => {
@@ -92,11 +96,13 @@ browser.runtime.onInstalled.addListener(() => {
 setInterval(() => {
   const now = Date.now();
   let removedAny = false;
+  clearExpiredOneTimeAllowances(now);
   for (const [requestId, request] of pendingRequests) {
     if (now - request.timestamp > APPROVAL_REQUEST_TIMEOUT_MS) {
       const timeoutError = new Error("Request timeout");
       request.reject(timeoutError);
       rejectPublicKeyJoiners(requestId, timeoutError);
+      rejectSignJoiners(requestId, timeoutError);
       pendingRequests.delete(requestId);
       removedAny = true;
     }
@@ -130,10 +136,6 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
 
         const selectedIdentity = (await resolveIdentityById(policy?.identityId ?? null)) ?? identity;
         const unlocked = await vault.isUnlocked();
-        const approvalBurstUntil = recentPublicKeyApprovals.get(requestOrigin) ?? 0;
-        if (approvalBurstUntil <= Date.now()) {
-          recentPublicKeyApprovals.delete(requestOrigin);
-        }
 
         if (policy?.mode === "always_allow") {
           if (unlocked) {
@@ -151,7 +153,8 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
           });
         }
 
-        if (unlocked && (recentPublicKeyApprovals.get(requestOrigin) ?? 0) > Date.now()) {
+        const publicKeyAllowanceKey = getPublicKeyAllowanceKey(requestOrigin);
+        if (requestOrigin !== "unknown" && unlocked && consumeOneTimeAllowance(publicKeyAllowanceKey)) {
           if (requestOrigin !== "unknown") {
             await bindOriginProfile(requestOrigin, selectedIdentity.id);
           }
@@ -218,6 +221,14 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
         }
 
         const unlocked = await vault.isUnlocked();
+        const signAllowanceKey = getSignEventAllowanceKey(requestOrigin, payload);
+        if (requestOrigin !== "unknown" && unlocked && consumeOneTimeAllowance(signAllowanceKey)) {
+          const signed = await signEventWithIdentity(payload, identity.id);
+          if (requestOrigin !== "unknown") {
+            await bindOriginProfile(requestOrigin, identity.id);
+          }
+          return signed;
+        }
         if (!unlocked) {
           await showNotification("Nostr Signer", `${requestOrigin} requests signature. Unlock to continue.`);
         }
@@ -252,6 +263,7 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
 
     case "UNLOCK_VAULT": {
       try {
+        await vault.reload();
         const pin = asString(data.pin);
         const ttlMs = asFiniteNumber(data.ttlMs);
         if (!pin) {
@@ -436,9 +448,65 @@ function getLatestPopupPendingRequest(): PopupPendingRequest | null {
   return toPopupPendingRequest(getLatestPendingRequest());
 }
 
+function getSignPayloadSignature(payload: SignEventPayload): string {
+  return JSON.stringify([payload.kind, payload.content, payload.tags]);
+}
+
+function getPublicKeyAllowanceKey(origin: string): string {
+  return `get_public_key::${origin}`;
+}
+
+function getSignEventAllowanceKey(origin: string, payload: SignEventPayload): string {
+  return `sign_event::${origin}::${getSignPayloadSignature(payload)}`;
+}
+
+function clearExpiredOneTimeAllowances(now = Date.now()) {
+  for (const [key, allowance] of oneTimeAllowances) {
+    if (allowance.expiresAt <= now || allowance.remaining <= 0) {
+      oneTimeAllowances.delete(key);
+    }
+  }
+}
+
+function consumeOneTimeAllowance(key: string): boolean {
+  const allowance = oneTimeAllowances.get(key);
+  if (!allowance) return false;
+  if (allowance.expiresAt <= Date.now() || allowance.remaining <= 0) {
+    oneTimeAllowances.delete(key);
+    return false;
+  }
+  allowance.remaining -= 1;
+  if (allowance.remaining <= 0) {
+    oneTimeAllowances.delete(key);
+  } else {
+    oneTimeAllowances.set(key, allowance);
+  }
+  return true;
+}
+
+function grantOneTimeAllowance(key: string) {
+  oneTimeAllowances.set(key, {
+    expiresAt: Date.now() + ONE_TIME_ALLOW_GRACE_MS,
+    remaining: 1,
+  });
+}
+
 function findPendingPublicKeyRequest(origin: string): PendingRequest | null {
   for (const request of pendingRequests.values()) {
     if (request.type === "get_public_key" && request.origin === origin) {
+      return request;
+    }
+  }
+  return null;
+}
+
+function findPendingSignRequest(origin: string, payload: SignEventPayload): PendingRequest | null {
+  const signature = getSignPayloadSignature(payload);
+  for (const request of pendingRequests.values()) {
+    if (request.type !== "sign_event") continue;
+    if (request.origin !== origin) continue;
+    if (!request.payload) continue;
+    if (getSignPayloadSignature(request.payload) === signature) {
       return request;
     }
   }
@@ -463,12 +531,39 @@ function rejectPublicKeyJoiners(requestId: string, reason: Error) {
   }
 }
 
+function resolveSignJoiners(requestId: string, signed: SignedNostrEvent) {
+  const joiners = pendingSignJoiners.get(requestId);
+  if (!joiners?.length) return;
+  pendingSignJoiners.delete(requestId);
+  for (const joiner of joiners) {
+    joiner.resolve(signed);
+  }
+}
+
+function rejectSignJoiners(requestId: string, reason: Error) {
+  const joiners = pendingSignJoiners.get(requestId);
+  if (!joiners?.length) return;
+  pendingSignJoiners.delete(requestId);
+  for (const joiner of joiners) {
+    joiner.reject(reason);
+  }
+}
+
 async function queuePendingSignRequest(params: {
   origin: string;
   payload: SignEventPayload;
   selectedIdentityId: string | null;
   autoApprove: boolean;
 }): Promise<SignedNostrEvent> {
+  const existing = findPendingSignRequest(params.origin, params.payload);
+  if (existing) {
+    return new Promise<SignedNostrEvent>((resolve, reject) => {
+      const joiners = pendingSignJoiners.get(existing.id) ?? [];
+      joiners.push({ resolve, reject });
+      pendingSignJoiners.set(existing.id, joiners);
+    });
+  }
+
   const requestId = crypto.randomUUID();
 
   return new Promise<SignedNostrEvent>((resolve, reject) => {
@@ -551,7 +646,7 @@ async function approvePendingRequest(requestId: string, requestedIdentityId: str
       request.resolve(identity.pubkey);
       resolvePublicKeyJoiners(request.id, identity.pubkey);
       if (!alwaysAllow && request.origin !== "unknown") {
-        recentPublicKeyApprovals.set(request.origin, Date.now() + PUBLIC_KEY_ALLOW_BURST_MS);
+        grantOneTimeAllowance(getPublicKeyAllowanceKey(request.origin));
       }
     } else {
       if (!request.payload) {
@@ -568,12 +663,17 @@ async function approvePendingRequest(requestId: string, requestedIdentityId: str
       }
 
       request.resolve(signed);
+      resolveSignJoiners(request.id, signed);
+      if (!alwaysAllow && request.origin !== "unknown") {
+        grantOneTimeAllowance(getSignEventAllowanceKey(request.origin, request.payload));
+      }
     }
     return { success: true };
   } catch (error) {
     const normalized = toError(error, "Signing failed");
     request.reject(normalized);
     rejectPublicKeyJoiners(request.id, normalized);
+    rejectSignJoiners(request.id, normalized);
     return { error: normalized.message };
   } finally {
     pendingRequests.delete(requestId);
@@ -598,6 +698,7 @@ async function rejectPendingRequest(requestId: string, alwaysReject: boolean) {
   const rejection = new Error("User rejected");
   request.reject(rejection);
   rejectPublicKeyJoiners(request.id, rejection);
+  rejectSignJoiners(request.id, rejection);
   pendingRequests.delete(requestId);
   void onPendingRequestsChanged(pendingRequests.size > 0);
 
@@ -853,7 +954,6 @@ async function buildTrustedWebsiteEntries(): Promise<TrustedWebsiteEntry[]> {
   const allOrigins = new Set<string>([
     ...Object.keys(signPolicies),
     ...Object.keys(publicKeyPolicies),
-    ...Object.keys(originProfiles),
   ]);
 
   const entries: TrustedWebsiteEntry[] = [...allOrigins]
