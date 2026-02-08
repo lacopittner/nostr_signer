@@ -112,9 +112,17 @@ setInterval(() => {
   }
 }, 60_000);
 
-browser.runtime.onMessage.addListener(async (message: unknown) => {
+browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.runtime.MessageSender) => {
   const data = toRecord(message);
   const type = asString(data.type);
+
+  // Verify origin matches sender for security
+  const claimedOrigin = parseRequestOrigin(data.origin);
+  const senderOrigin = getSenderOrigin(sender);
+  if (!verifyOriginMatch(claimedOrigin, senderOrigin)) {
+    console.warn(`[Nostr Signer] Origin mismatch: claimed=${claimedOrigin}, sender=${senderOrigin}`);
+    return { error: "Origin verification failed" };
+  }
 
   switch (type) {
     case "NOSTR_GET_PUBLIC_KEY": {
@@ -244,11 +252,75 @@ browser.runtime.onMessage.addListener(async (message: unknown) => {
       }
     }
 
-    case "NOSTR_NIP04_ENCRYPT":
-    case "NOSTR_NIP04_DECRYPT":
     case "NOSTR_NIP44_ENCRYPT":
     case "NOSTR_NIP44_DECRYPT": {
-      return { error: "NIP-04/NIP-44 not yet implemented" };
+      // NIP-44: Encrypted Direct Messages (NIP-44 spec)
+      // Uses secp256k1 ECDH + ChaCha20-Poly1305
+      try {
+        await vault.reload();
+        await enforceBackgroundLockPolicy();
+
+        const requestOrigin = parseRequestOrigin(data.origin);
+        const payload = toRecord(data.payload);
+
+        const peerPubkey = asString(payload.peerPubkey);
+        const encryptedContent = asString(payload.content);
+
+        if (!peerPubkey) {
+          return { error: "Missing peerPubkey for NIP-44 encryption" };
+        }
+
+        // Check if vault has encryption capability
+        const hasEncryption = await vault.supportsEncryption();
+
+        if (!hasEncryption) {
+          return {
+            error: "NIP-44 encryption not yet available",
+            hint: "This feature requires vault encryption support",
+            status: "pending_implementation"
+          };
+        }
+
+        const type = asString(data.type);
+        const isEncrypt = type === "NOSTR_NIP44_ENCRYPT";
+
+        if (isEncrypt) {
+          if (!encryptedContent) {
+            return { error: "Missing content to encrypt" };
+          }
+
+          try {
+            const result = await vault.encryptNip44(peerPubkey, encryptedContent, requestOrigin);
+            return { encrypted: result };
+          } catch (error) {
+            return { error: toErrorMessage(error, "Encryption failed") };
+          }
+        } else {
+          // Decrypt
+          if (!encryptedContent) {
+            return { error: "Missing content to decrypt" };
+          }
+
+          try {
+            const result = await vault.decryptNip44(peerPubkey, encryptedContent, requestOrigin);
+            return { decrypted: result };
+          } catch (error) {
+            return { error: toErrorMessage(error, "Decryption failed") };
+          }
+        }
+      } catch (error) {
+        return { error: toErrorMessage(error, "NIP-44 operation failed") };
+      }
+    }
+
+    case "NOSTR_NIP04_ENCRYPT":
+    case "NOSTR_NIP04_DECRYPT": {
+      // NIP-04 is deprecated - recommend NIP-44
+      return {
+        error: "NIP-04 is deprecated",
+        recommendation: "Use NIP-44 instead (more secure)",
+        status: "deprecated"
+      };
     }
 
     case "GET_PENDING_REQUEST": {
@@ -1011,6 +1083,33 @@ function normalizeOrigin(rawOrigin: unknown): string | null {
 function parseRequestOrigin(rawOrigin: unknown): string {
   const normalized = normalizeOrigin(rawOrigin);
   return normalized ?? "unknown";
+}
+
+function getSenderOrigin(sender: browser.runtime.MessageSender): string {
+  // sender.url contains the full URL, extract origin from it
+  if (sender.url) {
+    try {
+      const url = new URL(sender.url);
+      return url.origin;
+    } catch {
+      // Invalid URL, return empty
+      return "";
+    }
+  }
+  // For extension internal messages, check sender.origin
+  if (sender.origin) {
+    return sender.origin;
+  }
+  return "";
+}
+
+function verifyOriginMatch(claimedOrigin: string, senderOrigin: string): boolean {
+  // Allow "unknown" as fallback for legacy compatibility
+  if (claimedOrigin === "unknown") {
+    return true;
+  }
+  // Verify the claimed origin matches the actual sender origin
+  return claimedOrigin === senderOrigin;
 }
 
 function normalizeSignEventPayload(payload: unknown): SignEventPayload {

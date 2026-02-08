@@ -66,8 +66,8 @@
 body {
   margin: 0;
   background: var(--bg-gradient);
-  min-width: 520px;
-  min-height: 620px;
+  min-width: 320px;
+  min-height: 400px;
   color: var(--text-primary);
   transition: background 180ms ease, color 180ms ease;
 }

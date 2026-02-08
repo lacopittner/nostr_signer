@@ -1,6 +1,8 @@
 // Content script - injected into all pages.
 // It injects the inpage script (MAIN world) and bridges page messages to background.
 
+import shouldInject from "./shouldInject";
+
 console.log("[Nostr Signer] Content script loaded on", window.location.href);
 
 const NOSTR_REQUEST_TYPES = new Set([
@@ -36,7 +38,14 @@ function handleInvalidatedContext(message: string) {
   return { error: message || "Extension context invalidated. Please refresh this page." };
 }
 
-function injectInpageScript() {
+async function injectInpageScript() {
+  // Check if we should inject (guards for PDF, XML, etc.)
+  const canInject = await shouldInject();
+  if (!canInject) {
+    console.debug("[Nostr Signer] Skipping injection - guards prevented it");
+    return;
+  }
+
   console.log("[Nostr Signer] Starting injection...");
 
   if (document.getElementById("nostr-signer-inpage")) {
@@ -76,6 +85,10 @@ injectInpageScript();
 // Listen for messages from inpage script and forward to background
 window.addEventListener("message", async (event) => {
   if (event.source !== window) return;
+
+  // Validate application scope (Alby pattern)
+  if (event.data?.application !== "nostr-signer") return;
+
   const type = event.data?.type;
   if (typeof type !== "string" || !NOSTR_REQUEST_TYPES.has(type)) return;
 
@@ -139,9 +152,10 @@ window.addEventListener("message", async (event) => {
       {
         type: "NOSTR_RESPONSE",
         id,
+        application: "nostr-signer",
         payload: response,
       },
-      "*"
+      window.location.origin
     );
   } catch (error) {
     console.error("[Nostr Signer] Message error:", error);
@@ -149,11 +163,12 @@ window.addEventListener("message", async (event) => {
       {
         type: "NOSTR_RESPONSE",
         id,
+        application: "nostr-signer",
         payload: {
           error: error instanceof Error ? error.message : "Request failed",
         },
       },
-      "*"
+      window.location.origin
     );
   }
 });

@@ -197,10 +197,11 @@ function SignRequestScreen({
       </p>
 
       <div style={{ marginBottom: "16px" }}>
-        <label style={{ display: "block", fontSize: "13px", marginBottom: "6px", color: "var(--text-muted)" }}>
+        <label htmlFor="signing-profile" style={{ display: "block", fontSize: "13px", marginBottom: "6px", color: "var(--text-muted)" }}>
           Signing profile
         </label>
         <select
+          id="signing-profile"
           value={selectedProfileId}
           onChange={(e) => setSelectedProfileId(e.target.value)}
           style={{
@@ -377,12 +378,15 @@ function PinLockScreen({
       <p style={{ color: "var(--text-muted)", marginBottom: "20px" }}>Unlock Nostr Signer</p>
       
       <form onSubmit={handleSubmit}>
+        <label htmlFor="pin-input" style={{ position: "absolute", width: "1px", height: "1px", overflow: "hidden" }}>Enter PIN</label>
         <input
+          id="pin-input"
           type="password"
           value={pin}
           onChange={(e) => setPin(e.target.value)}
           placeholder="PIN"
           autoFocus
+          autoComplete="current-password"
           style={{
             width: "100%",
             padding: "12px",
@@ -404,12 +408,14 @@ function PinLockScreen({
             color: "var(--text-muted)",
             fontSize: "13px",
             marginBottom: "12px",
+            cursor: "pointer",
           }}
         >
           <input
             type="checkbox"
             checked={remember}
             onChange={(e) => setRemember(e.target.checked)}
+            id="remember-unlock"
           />
           Remember until browser closes
         </label>
@@ -483,12 +489,15 @@ function PinSetupScreen({
 
       {step === 1 ? (
         <form onSubmit={handleFirstStep}>
+          <label htmlFor="setup-pin" style={{ position: "absolute", width: "1px", height: "1px", overflow: "hidden" }}>Enter PIN</label>
           <input
+            id="setup-pin"
             type="password"
             value={pin}
             onChange={(e) => setPin(e.target.value)}
             placeholder="Enter PIN"
             autoFocus
+            autoComplete="new-password"
             style={{
               width: "100%",
               padding: "12px",
@@ -510,12 +519,14 @@ function PinSetupScreen({
               color: "var(--text-muted)",
               fontSize: "13px",
               marginBottom: "12px",
+              cursor: "pointer",
             }}
           >
             <input
               type="checkbox"
               checked={remember}
               onChange={(e) => setRemember(e.target.checked)}
+              id="remember-setup"
             />
             Remember until browser closes
           </label>
@@ -538,12 +549,15 @@ function PinSetupScreen({
         </form>
       ) : (
         <form onSubmit={handleConfirm}>
+          <label htmlFor="confirm-setup-pin" style={{ position: "absolute", width: "1px", height: "1px", overflow: "hidden" }}>Confirm PIN</label>
           <input
+            id="confirm-setup-pin"
             type="password"
             value={confirmPin}
             onChange={(e) => setConfirmPin(e.target.value)}
             placeholder="Confirm PIN"
             autoFocus
+            autoComplete="new-password"
             style={{
               width: "100%",
               padding: "12px",
@@ -629,6 +643,7 @@ export default function App() {
   const [showChangePin, setShowChangePin] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteConfirmText, setDeleteConfirmText] = useState("");
   const [copyDialog, setCopyDialog] = useState<{
     title: string;
     value: string;
@@ -1129,7 +1144,7 @@ export default function App() {
       setShowCreate(false);
       await refresh();
     } catch (err) {
-      alert(err instanceof Error ? err.message : "Failed to create");
+      showToast(err instanceof Error ? err.message : "Failed to create", "error");
     }
   };
 
@@ -1143,7 +1158,7 @@ export default function App() {
       setShowImport(false);
       await refresh();
     } catch (err) {
-      alert(err instanceof Error ? err.message : "Failed to import");
+      showToast(err instanceof Error ? err.message : "Failed to import", "error");
     }
   };
 
@@ -1156,19 +1171,25 @@ export default function App() {
       setEditLabel("");
       await refresh();
     } catch (err) {
-      alert(err instanceof Error ? err.message : "Failed to update");
+      showToast(err instanceof Error ? err.message : "Failed to update", "error");
     }
   };
 
   const handleDelete = async () => {
     if (!deletingId) return;
+    if (deleteConfirmText !== "DELETE") {
+      setChangePinError("Type DELETE to confirm");
+      return;
+    }
     
     try {
       await vault.removeIdentity(deletingId);
       setDeletingId(null);
+      setDeleteConfirmText("");
+      showToast("Identity deleted");
       await refresh();
     } catch (err) {
-      alert(err instanceof Error ? err.message : "Failed to delete");
+      showToast(err instanceof Error ? err.message : "Failed to delete", "error");
     }
   };
 
@@ -1329,19 +1350,6 @@ export default function App() {
 
     void ensureDefaultProfile();
   }, [defaultProfileId, identities]);
-
-  const handleSign = async () => {
-    try {
-      const signed = await vault.signEvent({
-        kind: 1,
-        content: "Test from Nostr Signer",
-        tags: [["client", "nostr-signer"]],
-      });
-      alert(`Signed! ID: ${signed.id.slice(0, 16)}...`);
-    } catch (err) {
-      alert(err instanceof Error ? err.message : "Failed to sign");
-    }
-  };
 
   if (isLoading) {
     return <div style={{ padding: 40, textAlign: "center" }}>Loading...</div>;
@@ -1620,23 +1628,6 @@ export default function App() {
         </p>
       )}
 
-      {/* Sign Button */}
-      {identities.length > 0 && (
-        <button
-          onClick={handleSign}
-          style={{
-            marginTop: "20px",
-            width: "100%",
-            padding: "12px",
-            background: "var(--success-surface)",
-            color: "var(--primary-action-text)",
-            border: "none",
-            borderRadius: "6px",
-            cursor: "pointer",
-          }}
-        >
-          ✍️ Sign Test Event
-        </button>
       )}
 
       {/* Trusted Websites */}
@@ -1826,14 +1817,20 @@ export default function App() {
         }}>
           <div style={{ background: "var(--modal-bg)", color: "var(--modal-text)", padding: "20px", borderRadius: "12px", width: "300px", border: "1px solid var(--border-muted)" }}>
             <h3>Create Identity</h3>
+            <label htmlFor="create-name" style={{ display: "block", marginBottom: "6px", fontSize: "13px", color: "var(--text-secondary)" }}>Name</label>
             <input
+              id="create-name"
               type="text"
               placeholder="Name (e.g., Personal)"
               value={newLabel}
               onChange={(e) => setNewLabel(e.target.value)}
               style={{ width: "100%", padding: "10px", marginBottom: "12px", borderRadius: "6px", border: "1px solid var(--border-muted)", background: "var(--surface-elevated)", color: "var(--text-primary)" }}
               autoFocus
+              aria-describedby="create-name-help"
             />
+            <p id="create-name-help" style={{ margin: 0, fontSize: "11px", color: "var(--text-muted)", marginBottom: "12px" }}>
+              Give this identity a memorable name
+            </p>
             <div style={{ display: "flex", gap: "8px" }}>
               <button
                 onClick={handleCreate}
@@ -1865,14 +1862,18 @@ export default function App() {
         }}>
           <div style={{ background: "var(--modal-bg)", color: "var(--modal-text)", padding: "20px", borderRadius: "12px", width: "300px", border: "1px solid var(--border-muted)" }}>
             <h3>Import Identity</h3>
+            <label htmlFor="import-name" style={{ display: "block", marginBottom: "6px", fontSize: "13px", color: "var(--text-secondary)" }}>Name</label>
             <input
+              id="import-name"
               type="text"
               placeholder="Name"
               value={newLabel}
               onChange={(e) => setNewLabel(e.target.value)}
               style={{ width: "100%", padding: "10px", marginBottom: "8px", borderRadius: "6px", border: "1px solid var(--border-muted)", background: "var(--surface-elevated)", color: "var(--text-primary)" }}
             />
+            <label htmlFor="import-key" style={{ display: "block", marginBottom: "6px", fontSize: "13px", color: "var(--text-secondary)" }}>Private Key</label>
             <textarea
+              id="import-key"
               placeholder="Private key (hex or nsec)"
               value={importKey}
               onChange={(e) => setImportKey(e.target.value)}
@@ -1909,7 +1910,9 @@ export default function App() {
         }}>
           <div style={{ background: "var(--modal-bg)", color: "var(--modal-text)", padding: "20px", borderRadius: "12px", width: "300px", border: "1px solid var(--border-muted)" }}>
             <h3>Edit Identity</h3>
+            <label htmlFor="edit-label" style={{ display: "block", marginBottom: "6px", fontSize: "13px", color: "var(--text-secondary)" }}>Name</label>
             <input
+              id="edit-label"
               type="text"
               value={editLabel}
               onChange={(e) => setEditLabel(e.target.value)}
@@ -1947,27 +1950,36 @@ export default function App() {
         }}>
           <div style={{ background: "var(--modal-bg)", color: "var(--modal-text)", padding: "20px", borderRadius: "12px", width: "320px", border: "1px solid var(--border-muted)" }}>
             <h3>Change PIN</h3>
+            <label htmlFor="current-pin" style={{ display: "block", marginBottom: "6px", fontSize: "13px", color: "var(--text-secondary)" }}>Current PIN</label>
             <input
+              id="current-pin"
               type="password"
               placeholder="Current PIN"
               value={currentPinInput}
               onChange={(e) => setCurrentPinInput(e.target.value)}
               style={{ width: "100%", padding: "10px", marginBottom: "8px", borderRadius: "6px", border: "1px solid var(--border-muted)", background: "var(--surface-elevated)", color: "var(--text-primary)" }}
               autoFocus
+              autoComplete="current-password"
             />
+            <label htmlFor="new-pin" style={{ display: "block", marginBottom: "6px", fontSize: "13px", color: "var(--text-secondary)" }}>New PIN</label>
             <input
+              id="new-pin"
               type="password"
               placeholder="New PIN"
               value={nextPinInput}
               onChange={(e) => setNextPinInput(e.target.value)}
               style={{ width: "100%", padding: "10px", marginBottom: "8px", borderRadius: "6px", border: "1px solid var(--border-muted)", background: "var(--surface-elevated)", color: "var(--text-primary)" }}
+              autoComplete="new-password"
             />
+            <label htmlFor="confirm-pin" style={{ display: "block", marginBottom: "6px", fontSize: "13px", color: "var(--text-secondary)" }}>Confirm New PIN</label>
             <input
+              id="confirm-pin"
               type="password"
               placeholder="Confirm new PIN"
               value={confirmNextPinInput}
               onChange={(e) => setConfirmNextPinInput(e.target.value)}
               style={{ width: "100%", padding: "10px", marginBottom: "10px", borderRadius: "6px", border: "1px solid var(--border-muted)", background: "var(--surface-elevated)", color: "var(--text-primary)" }}
+              autoComplete="new-password"
             />
             <label
               style={{
@@ -1977,12 +1989,14 @@ export default function App() {
                 color: "var(--text-muted)",
                 fontSize: "13px",
                 marginBottom: "10px",
+                cursor: "pointer",
               }}
             >
               <input
                 type="checkbox"
                 checked={changePinRemember}
                 onChange={(e) => setChangePinRemember(e.target.checked)}
+                id="remember-pin"
               />
               Remember until browser closes
             </label>
@@ -2027,15 +2041,29 @@ export default function App() {
             <p style={{ color: "var(--text-muted)", marginBottom: "16px" }}>
               This will permanently delete this identity and its private key.
             </p>
+            <label htmlFor="delete-confirm" style={{ display: "block", marginBottom: "8px", fontSize: "13px", color: "var(--text-secondary)" }}>
+              Type <strong>DELETE</strong> to confirm:
+            </label>
+            <input
+              id="delete-confirm"
+              type="text"
+              value={deleteConfirmText}
+              onChange={(e) => setDeleteConfirmText(e.target.value)}
+              placeholder="DELETE"
+              style={{ width: "100%", padding: "10px", marginBottom: "16px", borderRadius: "6px", border: "1px solid var(--border-muted)", fontSize: "14px" }}
+              autoComplete="off"
+              autoFocus
+            />
             <div style={{ display: "flex", gap: "8px" }}>
               <button
                 onClick={handleDelete}
-                style={{ flex: 1, padding: "10px", background: "var(--danger)", color: "var(--primary-action-text)", border: "none", borderRadius: "6px", cursor: "pointer" }}
+                disabled={deleteConfirmText !== "DELETE"}
+                style={{ flex: 1, padding: "10px", background: deleteConfirmText === "DELETE" ? "var(--danger)" : "var(--surface-soft)", color: deleteConfirmText === "DELETE" ? "var(--primary-action-text)" : "var(--text-muted)", border: "none", borderRadius: "6px", cursor: deleteConfirmText === "DELETE" ? "pointer" : "not-allowed", opacity: deleteConfirmText === "DELETE" ? 1 : 0.5 }}
               >
                 Delete
               </button>
               <button
-                onClick={() => setDeletingId(null)}
+                onClick={() => { setDeletingId(null); setDeleteConfirmText(""); }}
                 style={{ flex: 1, padding: "10px", background: "var(--surface-soft)", color: "var(--text-primary)", border: "1px solid var(--border-muted)", borderRadius: "6px", cursor: "pointer" }}
               >
                 Cancel

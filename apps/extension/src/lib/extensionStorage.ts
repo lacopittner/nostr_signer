@@ -4,55 +4,35 @@ import browser from "webextension-polyfill";
 const STORAGE_KEY = "nostrSignerVault";
 
 function safeClone(state: VaultState): VaultState {
-  return structuredClone(state);
+  return {
+    identities: state.identities,
+    masterKey: null, // Never persist masterKey
+    encryptedVault: state.encryptedVault,
+    activeIdentityId: state.activeIdentityId ?? undefined,
+  };
 }
 
 export class ExtensionVaultStorage implements VaultStorage {
   async load(): Promise<VaultState | null> {
-    const fromExtensionApi = await this.loadFromExtensionStorage();
-    if (fromExtensionApi) {
-      return fromExtensionApi;
-    }
-
-    if (typeof localStorage === "undefined") {
-      return null;
-    }
-
-    const payload = localStorage.getItem(STORAGE_KEY);
-    if (!payload) {
-      return null;
-    }
-
     try {
-      const decoded = JSON.parse(payload) as VaultState;
-      return safeClone(decoded);
+      const payload = await browser.storage.local.get(STORAGE_KEY);
+      const state = payload[STORAGE_KEY] as VaultState | undefined;
+      if (!state) return null;
+
+      // Return state without masterKey for safety
+      return safeClone(state);
     } catch {
-      return createEmptyVaultState();
+      return null;
     }
   }
 
   async save(state: VaultState): Promise<void> {
-    await this.saveToExtensionStorage(state);
-
-    if (typeof localStorage !== "undefined") {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    }
-  }
-
-  private async loadFromExtensionStorage(): Promise<VaultState | null> {
     try {
-      const payload = await browser.storage.local.get(STORAGE_KEY);
-      return (payload[STORAGE_KEY] as VaultState | undefined) ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  private async saveToExtensionStorage(state: VaultState): Promise<void> {
-    try {
-      await browser.storage.local.set({ [STORAGE_KEY]: safeClone(state) });
-    } catch {
-      // Popup sandbox can block storage API in local previews.
+      await browser.storage.local.set({
+        [STORAGE_KEY]: safeClone(state),
+      });
+    } catch (error) {
+      console.error("Failed to save vault:", error);
     }
   }
 }

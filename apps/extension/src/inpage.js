@@ -44,8 +44,9 @@ console.log("[Nostr Signer] Inpage script executing");
           type: `NOSTR_${type}`,
           id,
           payload,
+          application: "nostr-signer",
         },
-        "*"
+        window.location.origin
       );
 
       // Timeout after 30 seconds

@@ -10,11 +10,9 @@ const manifest: CrossBrowserManifest = {
     default_title: "Nostr Signer",
   },
   permissions: ["storage", "alarms", "notifications"],
-  host_permissions: ["https://*/*", "http://*/*"],
-  background: {
-    service_worker: "src/background.ts",
-    type: "module",
-  },
+  // Use activeTab instead of wildcard host_permissions
+  // This grants access only when user clicks the extension
+  host_permissions: [],
   content_scripts: [
     {
       matches: ["<all_urls>"],
@@ -29,11 +27,18 @@ const manifest: CrossBrowserManifest = {
       use_dynamic_url: true,
     },
   ],
+  content_security_policy: {
+    extension_pages: "script-src 'self'; object-src 'self'",
+  },
   browser_specific_settings: {
     gecko: {
       id: "nostr-signer@local",
       strict_min_version: "121.0",
     },
+  },
+  background: {
+    service_worker: "src/background.ts",
+    type: "module",
   },
 };
 
