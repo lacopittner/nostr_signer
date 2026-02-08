@@ -382,6 +382,7 @@ function PinLockScreen({
         <input
           id="pin-input"
           type="password"
+          maxLength={20}
           value={pin}
           onChange={(e) => setPin(e.target.value)}
           placeholder="PIN"
@@ -553,6 +554,7 @@ function PinSetupScreen({
           <input
             id="confirm-setup-pin"
             type="password"
+            maxLength={20}
             value={confirmPin}
             onChange={(e) => setConfirmPin(e.target.value)}
             placeholder="Confirm PIN"
@@ -927,8 +929,7 @@ export default function App() {
           await refresh();
           await refreshTrustedSites();
         }
-      } catch (error) {
-        console.error("[Nostr Signer] Vault init failed:", error);
+      } catch {
         showToast("Vault storage read failed. Reload extension.", "error");
       }
       
@@ -1628,8 +1629,6 @@ export default function App() {
         </p>
       )}
 
-      )}
-
       {/* Trusted Websites */}
       <div
         style={{
@@ -1954,6 +1953,7 @@ export default function App() {
             <input
               id="current-pin"
               type="password"
+              maxLength={20}
               placeholder="Current PIN"
               value={currentPinInput}
               onChange={(e) => setCurrentPinInput(e.target.value)}
@@ -1965,6 +1965,7 @@ export default function App() {
             <input
               id="new-pin"
               type="password"
+              maxLength={20}
               placeholder="New PIN"
               value={nextPinInput}
               onChange={(e) => setNextPinInput(e.target.value)}
@@ -1975,6 +1976,7 @@ export default function App() {
             <input
               id="confirm-pin"
               type="password"
+              maxLength={20}
               placeholder="Confirm new PIN"
               value={confirmNextPinInput}
               onChange={(e) => setConfirmNextPinInput(e.target.value)}

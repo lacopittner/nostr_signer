@@ -3,8 +3,6 @@
 
 import shouldInject from "./shouldInject";
 
-console.log("[Nostr Signer] Content script loaded on", window.location.href);
-
 const NOSTR_REQUEST_TYPES = new Set([
   "NOSTR_GET_PUBLIC_KEY",
   "NOSTR_SIGN_EVENT",
@@ -42,11 +40,8 @@ async function injectInpageScript() {
   // Check if we should inject (guards for PDF, XML, etc.)
   const canInject = await shouldInject();
   if (!canInject) {
-    console.debug("[Nostr Signer] Skipping injection - guards prevented it");
     return;
   }
-
-  console.log("[Nostr Signer] Starting injection...");
 
   if (document.getElementById("nostr-signer-inpage")) {
     return;
@@ -58,10 +53,8 @@ async function injectInpageScript() {
   script.async = false;
   script.onload = () => {
     script.remove();
-    console.log("[Nostr Signer] NIP-07 API injected and ready");
   };
   script.onerror = () => {
-    console.error("[Nostr Signer] Failed to inject inpage script");
     script.remove();
   };
 
@@ -92,8 +85,6 @@ window.addEventListener("message", async (event) => {
   const type = event.data?.type;
   if (typeof type !== "string" || !NOSTR_REQUEST_TYPES.has(type)) return;
 
-  console.log("[Nostr Signer] Received message:", type);
-
   const { id, payload } = event.data;
 
   // Wrap chrome.runtime.sendMessage in a way that handles context invalidation
@@ -116,7 +107,6 @@ window.addEventListener("message", async (event) => {
             // Check for runtime error (context invalidated)
             if (chrome.runtime.lastError) {
               const runtimeMessage = chrome.runtime.lastError.message || "Extension context invalidated";
-              console.error("[Nostr Signer] Runtime error:", runtimeMessage);
               if (isContextInvalidatedMessage(runtimeMessage)) {
                 resolve(handleInvalidatedContext(runtimeMessage));
                 return;
@@ -133,7 +123,6 @@ window.addEventListener("message", async (event) => {
           }
         );
       } catch (error) {
-        console.error("[Nostr Signer] Send error:", error);
         const errorMessage = error instanceof Error ? error.message : "Failed to send message";
         if (isContextInvalidatedMessage(errorMessage)) {
           resolve(handleInvalidatedContext(errorMessage));
@@ -146,7 +135,6 @@ window.addEventListener("message", async (event) => {
 
   try {
     const response = await sendToBackground();
-    console.log("[Nostr Signer] Background response:", response);
 
     window.postMessage(
       {
@@ -158,7 +146,6 @@ window.addEventListener("message", async (event) => {
       window.location.origin
     );
   } catch (error) {
-    console.error("[Nostr Signer] Message error:", error);
     window.postMessage(
       {
         type: "NOSTR_RESPONSE",

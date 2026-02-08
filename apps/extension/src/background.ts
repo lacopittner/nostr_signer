@@ -11,6 +11,37 @@ const SESSION_UNLOCK_KEY = "nostr_signer_session_unlock";
 const LOCKED_STATE_KEY = "nostr_signer_locked";
 const APPROVAL_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 const ONE_TIME_ALLOW_GRACE_MS = 3_000;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const MAX_REQUESTS_PER_WINDOW = 20;
+
+// Rate limit tracking with automatic cleanup
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+
+function checkRateLimit(origin: string): boolean {
+  const now = Date.now();
+  const current = rateLimitMap.get(origin);
+
+  if (!current || current.resetTime < now) {
+    rateLimitMap.set(origin, { count: 1, resetTime: now + RATE_LIMIT_WINDOW_MS });
+    return true;
+  }
+
+  if (current.count >= MAX_REQUESTS_PER_WINDOW) {
+    return false;
+  }
+
+  current.count++;
+  rateLimitMap.set(origin, current);
+  return true;
+}
+
+function clearExpiredRateLimits(now: number) {
+  for (const [origin, data] of rateLimitMap) {
+    if (data.resetTime < now) {
+      rateLimitMap.delete(origin);
+    }
+  }
+}
 
 const DEFAULT_RELAYS: Record<string, { read: boolean; write: boolean }> = {
   "wss://relay.damus.io": { read: true, write: true },
@@ -90,13 +121,14 @@ const oneTimeAllowances = new Map<string, { expiresAt: number; remaining: number
 let approvalSurfaceOpening: Promise<boolean> | null = null;
 
 browser.runtime.onInstalled.addListener(() => {
-  console.info("Nostr Signer installed");
+  // Extension installed/updated
 });
 
 setInterval(() => {
   const now = Date.now();
   let removedAny = false;
   clearExpiredOneTimeAllowances(now);
+  clearExpiredRateLimits(now);
   for (const [requestId, request] of pendingRequests) {
     if (now - request.timestamp > APPROVAL_REQUEST_TIMEOUT_MS) {
       const timeoutError = new Error("Request timeout");
@@ -810,8 +842,7 @@ async function ensureApprovalSurface(): Promise<boolean> {
     try {
       await browser.action.openPopup();
       return true;
-    } catch (error) {
-      console.error("[Nostr Signer] Failed to open extension popup:", error);
+    } catch {
       return false;
     }
   })();
@@ -831,7 +862,7 @@ async function showNotification(title: string, message: string) {
   try {
     await browser.notifications.create({
       type: "basic",
-      iconUrl: "/vite.svg",
+      iconUrl: browser.runtime.getURL("icon-128.png"),
       title,
       message,
     });
