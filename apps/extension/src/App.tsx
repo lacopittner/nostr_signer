@@ -70,6 +70,17 @@ function describeEventKind(kind: unknown): string {
   return "Custom event";
 }
 
+function formatEventTimestamp(unixTimestamp: unknown): string | null {
+  if (typeof unixTimestamp !== "number" || !Number.isFinite(unixTimestamp)) {
+    return null;
+  }
+  try {
+    return new Date(unixTimestamp * 1000).toLocaleString();
+  } catch {
+    return null;
+  }
+}
+
 // Sign Request Confirmation Screen
 function SignRequestScreen({
   requestId,
@@ -94,10 +105,16 @@ function SignRequestScreen({
 }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [autoApproveAttempted, setAutoApproveAttempted] = useState(false);
+  const [autoApproveHandled, setAutoApproveHandled] = useState(false);
+  const [showRawEvent, setShowRawEvent] = useState(false);
   const [selectedProfileId, setSelectedProfileId] = useState(
     initialProfileId ?? defaultProfileId ?? identities[0]?.id ?? ""
   );
+
+  useEffect(() => {
+    setAutoApproveHandled(false);
+    setShowRawEvent(false);
+  }, [requestId]);
 
   useEffect(() => {
     if (!identities.length) {
@@ -165,10 +182,17 @@ function SignRequestScreen({
   };
 
   useEffect(() => {
-    if (!autoApprove || autoApproveAttempted || !selectedProfileId) return;
-    setAutoApproveAttempted(true);
+    if (!autoApprove || autoApproveHandled || loading) return;
+    if (!selectedProfileId) return;
+    setAutoApproveHandled(true);
     void handleApprove(false);
-  }, [autoApprove, autoApproveAttempted, selectedProfileId]);
+  }, [autoApprove, autoApproveHandled, loading, selectedProfileId]);
+
+  const eventKind = typeof event?.kind === "number" ? event.kind : null;
+  const eventContent = typeof event?.content === "string" ? event.content : "";
+  const eventTags = Array.isArray(event?.tags) ? event.tags : [];
+  const eventCreatedAt = formatEventTimestamp(event?.created_at);
+  const rawEventJson = requestType === "sign_event" && event ? JSON.stringify(event, null, 2) : "";
 
   return (
     <div style={{ padding: "20px", width: "500px", maxWidth: "100%" }}>
@@ -233,7 +257,16 @@ function SignRequestScreen({
           }}
         >
           <div style={{ marginBottom: "8px" }}>
-            <strong>Kind:</strong> {event.kind} - {describeEventKind(event.kind)}
+            <strong>Kind:</strong>{" "}
+            {eventKind === null ? "Unknown" : `${eventKind} - ${describeEventKind(eventKind)}`}
+          </div>
+          {eventCreatedAt && (
+            <div style={{ marginBottom: "8px" }}>
+              <strong>Created:</strong> {eventCreatedAt}
+            </div>
+          )}
+          <div style={{ marginBottom: "8px" }}>
+            <strong>Tags:</strong> {eventTags.length}
           </div>
           <div style={{ marginBottom: "8px" }}>
             <strong>Content:</strong>
@@ -248,13 +281,42 @@ function SignRequestScreen({
                 overflow: "auto",
               }}
             >
-              {event.content}
+              {eventContent || "(empty)"}
             </div>
           </div>
-          {event.tags?.length > 0 && (
-            <div>
-              <strong>Tags:</strong> {event.tags.length}
-            </div>
+          <button
+            type="button"
+            onClick={() => setShowRawEvent((current) => !current)}
+            style={{
+              padding: "6px 10px",
+              background: "var(--surface-soft)",
+              color: "var(--text-primary)",
+              border: "1px solid var(--border-muted)",
+              borderRadius: "6px",
+              cursor: "pointer",
+              fontSize: "12px",
+              marginBottom: showRawEvent ? "8px" : "0",
+            }}
+          >
+            {showRawEvent ? "Hide raw event" : "Show raw event"}
+          </button>
+          {showRawEvent && (
+            <pre
+              style={{
+                margin: 0,
+                padding: "8px",
+                background: "var(--surface-elevated)",
+                borderRadius: "6px",
+                border: "1px solid var(--border-muted)",
+                overflow: "auto",
+                maxHeight: "170px",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                fontSize: "12px",
+              }}
+            >
+              {rawEventJson}
+            </pre>
           )}
         </div>
       )}
