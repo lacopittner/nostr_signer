@@ -5,6 +5,7 @@ import { vault } from "./lib/vault";
 const DEFAULT_PROFILE_KEY = "nostr_signer_default_profile_id";
 const ORIGIN_PROFILE_MAP_KEY = "nostr_signer_origin_profile_map";
 const SIGN_POLICY_MAP_KEY = "nostr_signer_sign_policy_map";
+const SIGN_ALLOWED_KINDS_MAP_KEY = "nostr_signer_sign_allowed_kinds_map";
 const PUBLIC_KEY_POLICY_MAP_KEY = "nostr_signer_public_key_policy_map";
 const REMEMBER_UNLOCK_KEY = "nostr_signer_remember_unlock";
 const SESSION_UNLOCK_KEY = "nostr_signer_session_unlock";
@@ -56,7 +57,13 @@ interface SignPolicy {
   identityId?: string;
 }
 
+interface SignKindAllowance {
+  kinds: number[];
+  identityId?: string;
+}
+
 type SignPolicyMap = Record<string, SignPolicy>;
+type SignKindAllowanceMap = Record<string, SignKindAllowance>;
 type PublicKeyPolicyMap = Record<string, SignPolicy>;
 type OriginProfileMap = Record<string, string>;
 
@@ -75,6 +82,8 @@ interface TrustedWebsiteEntry {
   signPolicy: TrustedSignPolicyMode;
   policyIdentityId: string | null;
   boundProfileId: string | null;
+  allowedSignKinds: number[];
+  signAllowAll: boolean;
   capabilities: TrustedCapability[];
 }
 
@@ -232,7 +241,9 @@ browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.r
         }
 
         const signPolicies = await loadSignPolicies();
+        const signKindAllowances = await loadSignKindAllowances();
         const policy = signPolicies[requestOrigin];
+        const kindAllowance = signKindAllowances[requestOrigin];
 
         if (policy?.mode === "always_reject") {
           return { error: "Rejected by policy" };
@@ -241,6 +252,29 @@ browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.r
         if (policy?.mode === "always_allow") {
           const policyIdentity = await resolveIdentityById(policy.identityId ?? null);
           const selectedIdentity = policyIdentity ?? identity;
+          const unlocked = await vault.isUnlocked();
+
+          if (unlocked) {
+            const signed = await signEventWithIdentity(payload, selectedIdentity.id);
+            if (requestOrigin !== "unknown") {
+              await bindOriginProfile(requestOrigin, selectedIdentity.id);
+            }
+            return signed;
+          }
+
+          await showNotification("Nostr Signer", `${requestOrigin} requests signature. Unlock to continue.`);
+          return await queuePendingSignRequest({
+            origin: requestOrigin,
+            payload,
+            selectedIdentityId: selectedIdentity.id,
+            autoApprove: true,
+          });
+        }
+
+        const isKindAllowed = Boolean(kindAllowance?.kinds?.includes(payload.kind));
+        if (isKindAllowed) {
+          const kindIdentity = await resolveIdentityById(kindAllowance?.identityId ?? null);
+          const selectedIdentity = kindIdentity ?? identity;
           const unlocked = await vault.isUnlocked();
 
           if (unlocked) {
@@ -427,6 +461,7 @@ browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.r
       const requestedBoundProfileId = asString(payload.boundProfileId) || null;
 
       const signPolicies = await loadSignPolicies();
+      const signKindAllowances = await loadSignKindAllowances();
       const publicKeyPolicies = await loadPublicKeyPolicies();
       const originProfiles = await loadOriginProfiles();
 
@@ -439,8 +474,10 @@ browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.r
           return { error: "No profile available for always allow" };
         }
         signPolicies[requestOrigin] = { mode: "always_allow", identityId: resolvedIdentityId };
+        delete signKindAllowances[requestOrigin];
       } else if (signPolicy === "always_reject") {
         signPolicies[requestOrigin] = { mode: "always_reject" };
+        delete signKindAllowances[requestOrigin];
       } else {
         delete signPolicies[requestOrigin];
       }
@@ -471,6 +508,7 @@ browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.r
       }
 
       await saveSignPolicies(signPolicies);
+      await saveSignKindAllowances(signKindAllowances);
       await savePublicKeyPolicies(publicKeyPolicies);
       await saveOriginProfiles(originProfiles);
 
@@ -486,14 +524,17 @@ browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.r
       }
 
       const signPolicies = await loadSignPolicies();
+      const signKindAllowances = await loadSignKindAllowances();
       const publicKeyPolicies = await loadPublicKeyPolicies();
       const originProfiles = await loadOriginProfiles();
 
       delete signPolicies[requestOrigin];
+      delete signKindAllowances[requestOrigin];
       delete publicKeyPolicies[requestOrigin];
       delete originProfiles[requestOrigin];
 
       await saveSignPolicies(signPolicies);
+      await saveSignKindAllowances(signKindAllowances);
       await savePublicKeyPolicies(publicKeyPolicies);
       await saveOriginProfiles(originProfiles);
 
@@ -508,7 +549,8 @@ browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.r
       }
       const identityId = asString(data.identityId) || null;
       const alwaysAllow = Boolean(data.alwaysAllow);
-      return approvePendingRequest(requestId, identityId, alwaysAllow);
+      const allowAllKinds = Boolean(data.allowAllKinds);
+      return approvePendingRequest(requestId, identityId, alwaysAllow, allowAllKinds);
     }
 
     case "REJECT_REQUEST": {
@@ -722,7 +764,12 @@ async function queuePendingPublicKeyRequest(params: {
   });
 }
 
-async function approvePendingRequest(requestId: string, requestedIdentityId: string | null, alwaysAllow: boolean) {
+async function approvePendingRequest(
+  requestId: string,
+  requestedIdentityId: string | null,
+  alwaysAllow: boolean,
+  allowAllKinds: boolean
+) {
   const request = pendingRequests.get(requestId);
   if (!request) {
     return { error: "Request not found" };
@@ -762,7 +809,12 @@ async function approvePendingRequest(requestId: string, requestedIdentityId: str
       if (request.origin !== "unknown") {
         await bindOriginProfile(request.origin, identityId);
         if (alwaysAllow) {
-          await saveSignPolicy(request.origin, { mode: "always_allow", identityId });
+          if (allowAllKinds) {
+            await saveSignPolicy(request.origin, { mode: "always_allow", identityId });
+            await removeSignKindAllowance(request.origin);
+          } else {
+            await addAllowedSignKind(request.origin, request.payload.kind, identityId);
+          }
         }
       }
 
@@ -1010,6 +1062,36 @@ async function loadSignPolicies(): Promise<SignPolicyMap> {
   }
 }
 
+async function loadSignKindAllowances(): Promise<SignKindAllowanceMap> {
+  try {
+    const result = await browser.storage.local.get(SIGN_ALLOWED_KINDS_MAP_KEY);
+    const raw = result[SIGN_ALLOWED_KINDS_MAP_KEY];
+    if (!raw || typeof raw !== "object") return {};
+
+    const normalized: SignKindAllowanceMap = {};
+    for (const [origin, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (!value || typeof value !== "object") continue;
+      const entry = value as Record<string, unknown>;
+      const kinds = Array.isArray(entry.kinds)
+        ? entry.kinds
+            .filter((item): item is number => typeof item === "number" && Number.isFinite(item))
+            .map((item) => Math.trunc(item))
+        : [];
+      const uniqueKinds = [...new Set(kinds)].sort((a, b) => a - b);
+      if (!uniqueKinds.length) continue;
+
+      normalized[origin] = {
+        kinds: uniqueKinds,
+        identityId: typeof entry.identityId === "string" && entry.identityId ? entry.identityId : undefined,
+      };
+    }
+
+    return normalized;
+  } catch {
+    return {};
+  }
+}
+
 async function loadPublicKeyPolicies(): Promise<PublicKeyPolicyMap> {
   try {
     const result = await browser.storage.local.get(PUBLIC_KEY_POLICY_MAP_KEY);
@@ -1035,6 +1117,33 @@ async function saveSignPolicies(policies: SignPolicyMap) {
   }
 }
 
+async function saveSignKindAllowances(map: SignKindAllowanceMap) {
+  try {
+    await browser.storage.local.set({ [SIGN_ALLOWED_KINDS_MAP_KEY]: map });
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+async function addAllowedSignKind(origin: string, kind: number, identityId: string) {
+  const map = await loadSignKindAllowances();
+  const current = map[origin];
+  const existingKinds = current?.kinds ?? [];
+  const nextKinds = [...new Set([...existingKinds, Math.trunc(kind)])].sort((a, b) => a - b);
+  map[origin] = {
+    kinds: nextKinds,
+    identityId,
+  };
+  await saveSignKindAllowances(map);
+}
+
+async function removeSignKindAllowance(origin: string) {
+  const map = await loadSignKindAllowances();
+  if (!map[origin]) return;
+  delete map[origin];
+  await saveSignKindAllowances(map);
+}
+
 async function savePublicKeyPolicy(origin: string, policy: SignPolicy) {
   const policies = await loadPublicKeyPolicies();
   policies[origin] = policy;
@@ -1051,11 +1160,13 @@ async function savePublicKeyPolicies(policies: PublicKeyPolicyMap) {
 
 async function buildTrustedWebsiteEntries(): Promise<TrustedWebsiteEntry[]> {
   const signPolicies = await loadSignPolicies();
+  const signKindAllowances = await loadSignKindAllowances();
   const publicKeyPolicies = await loadPublicKeyPolicies();
   const originProfiles = await loadOriginProfiles();
 
   const allOrigins = new Set<string>([
     ...Object.keys(signPolicies),
+    ...Object.keys(signKindAllowances),
     ...Object.keys(publicKeyPolicies),
   ]);
 
@@ -1063,6 +1174,7 @@ async function buildTrustedWebsiteEntries(): Promise<TrustedWebsiteEntry[]> {
     .sort((a, b) => a.localeCompare(b))
     .map((origin) => {
       const signPolicy = signPolicies[origin];
+      const signKindAllowance = signKindAllowances[origin];
       const getPublicKeyPolicy = publicKeyPolicies[origin];
       return {
         origin,
@@ -1070,9 +1182,12 @@ async function buildTrustedWebsiteEntries(): Promise<TrustedWebsiteEntry[]> {
         signPolicy: signPolicy?.mode ?? "ask",
         policyIdentityId:
           (signPolicy?.mode === "always_allow" ? signPolicy.identityId : null) ??
+          (signKindAllowance?.identityId ?? null) ??
           (getPublicKeyPolicy?.mode === "always_allow" ? getPublicKeyPolicy.identityId : null) ??
           null,
         boundProfileId: originProfiles[origin] ?? null,
+        allowedSignKinds: signKindAllowance?.kinds ?? [],
+        signAllowAll: signPolicy?.mode === "always_allow",
         capabilities: [
           {
             key: "get_public_key",

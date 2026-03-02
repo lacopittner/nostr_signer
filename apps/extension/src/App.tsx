@@ -27,6 +27,8 @@ interface TrustedWebsiteEntry {
   signPolicy: TrustedSignPolicyMode;
   policyIdentityId: string | null;
   boundProfileId: string | null;
+  allowedSignKinds: number[];
+  signAllowAll: boolean;
   capabilities: TrustedCapability[];
 }
 
@@ -138,7 +140,7 @@ function SignRequestScreen({
     }, 40);
   };
 
-  const handleApprove = async (alwaysAllow: boolean) => {
+  const handleApprove = async (alwaysAllow: boolean, allowAllKinds = false) => {
     if (!selectedProfileId) {
       setError("Select profile for signing");
       return;
@@ -151,8 +153,14 @@ function SignRequestScreen({
         requestId,
         identityId: selectedProfileId,
         alwaysAllow,
+        allowAllKinds,
       });
       if (response?.error) {
+        // Request already resolved (approved/expired) — treat as done
+        if (typeof response.error === "string" && response.error.includes("not found")) {
+          completeAndClose();
+          return;
+        }
         throw new Error(response.error);
       }
       completeAndClose();
@@ -172,6 +180,11 @@ function SignRequestScreen({
         alwaysReject,
       });
       if (response?.error) {
+        // Request already resolved — treat as done
+        if (typeof response.error === "string" && response.error.includes("not found")) {
+          completeAndClose();
+          return;
+        }
         throw new Error(response.error);
       }
       completeAndClose();
@@ -399,9 +412,33 @@ function SignRequestScreen({
             fontWeight: 600,
           }}
         >
-          Always Allow
+          {requestType === "sign_event" ? "Always Allow This Kind" : "Always Allow"}
         </button>
       </div>
+
+      {requestType === "sign_event" && (
+        <div style={{ marginTop: "8px" }}>
+          <button
+            onClick={() => {
+              void handleApprove(true, true);
+            }}
+            disabled={loading}
+            style={{
+              width: "100%",
+              padding: "12px",
+              background: "transparent",
+              color: "var(--active-text)",
+              border: "1px solid color-mix(in srgb, var(--active-text) 70%, var(--border-muted))",
+              borderRadius: "8px",
+              cursor: "pointer",
+              fontSize: "13px",
+              fontWeight: 700,
+            }}
+          >
+            Allow All Kinds on This Website
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -410,9 +447,11 @@ function SignRequestScreen({
 function PinLockScreen({
   onUnlock,
   defaultRemember,
+  pendingContext,
 }: {
   onUnlock: (pin: string, remember: boolean) => Promise<boolean>;
   defaultRemember: boolean;
+  pendingContext?: { origin: string; type: "sign_event" | "get_public_key" } | null;
 }) {
   const [pin, setPin] = useState("");
   const [error, setError] = useState("");
@@ -437,7 +476,15 @@ function PinLockScreen({
     <div style={{ padding: "40px 20px", textAlign: "center", width: "500px", maxWidth: "100%" }}>
       <div style={{ fontSize: "48px", marginBottom: "20px" }}>🔒</div>
       <h2>Enter PIN</h2>
-      <p style={{ color: "var(--text-muted)", marginBottom: "20px" }}>Unlock Nostr Signer</p>
+      {pendingContext ? (
+        <p style={{ color: "var(--text-muted)", marginBottom: "20px", fontSize: "14px" }}>
+          <strong>{pendingContext.origin}</strong>{" "}
+          {pendingContext.type === "sign_event" ? "wants to sign an event" : "wants to access your public key"}
+          {" — unlock to proceed"}
+        </p>
+      ) : (
+        <p style={{ color: "var(--text-muted)", marginBottom: "20px" }}>Unlock Nostr Signer</p>
+      )}
       
       <form onSubmit={handleSubmit}>
         <label htmlFor="pin-input" style={{ position: "absolute", width: "1px", height: "1px", overflow: "hidden" }}>Enter PIN</label>
@@ -722,6 +769,7 @@ export default function App() {
     Record<string, { getPublicKeyPolicy: TrustedSignPolicyMode; signPolicy: TrustedSignPolicyMode; boundProfileId: string }>
   >({});
   const [trustedSitesLoading, setTrustedSitesLoading] = useState(false);
+  const [expandedTrustedSites, setExpandedTrustedSites] = useState<Set<string>>(new Set());
   
   // Form states
   const [newLabel, setNewLabel] = useState("");
@@ -846,6 +894,12 @@ export default function App() {
               signPolicy,
               policyIdentityId: typeof entry?.policyIdentityId === "string" ? entry.policyIdentityId : null,
               boundProfileId: typeof entry?.boundProfileId === "string" ? entry.boundProfileId : null,
+              allowedSignKinds: Array.isArray(entry?.allowedSignKinds)
+                ? [...new Set((entry.allowedSignKinds as any[])
+                    .filter((item) => typeof item === "number" && Number.isFinite(item))
+                    .map((item) => Math.trunc(item)))].sort((a, b) => a - b)
+                : [],
+              signAllowAll: Boolean(entry?.signAllowAll) || signPolicy === "always_allow",
               capabilities: capabilities.length ? capabilities : capabilityFallback,
             };
           })
@@ -1057,6 +1111,7 @@ export default function App() {
     setIsLocked(false);
     await refresh();
     await refreshTrustedSites();
+    await refreshPendingRequest();
     return true;
   };
 
@@ -1102,6 +1157,7 @@ export default function App() {
     setIsLocked(false);
     await refresh();
     await refreshTrustedSites();
+    await refreshPendingRequest();
   };
 
   const handleLock = async () => {
@@ -1423,7 +1479,13 @@ export default function App() {
   }
 
   if (isLocked) {
-    return <PinLockScreen onUnlock={handleUnlock} defaultRemember={rememberUnlock} />;
+    return (
+      <PinLockScreen
+        onUnlock={handleUnlock}
+        defaultRemember={rememberUnlock}
+        pendingContext={pendingRequest ? { origin: pendingRequest.origin, type: pendingRequest.type } : null}
+      />
+    );
   }
 
   // Show sign request confirmation first after unlock
@@ -1703,48 +1765,86 @@ export default function App() {
       >
         <h3 style={{ margin: "0 0 10px 0", fontSize: "15px" }}>Trusted Websites</h3>
         <p style={{ margin: "0 0 10px 0", color: "var(--text-muted)", fontSize: "12px" }}>
-          Websites appear here after you choose Always Allow or Always Reject.
-        </p>
+            Websites appear here after you choose Always Allow, Always Allow This Kind, or Always Reject.
+            </p>
 
-        {trustedSitesLoading ? (
-          <p style={{ margin: 0, color: "var(--text-muted)", fontSize: "13px" }}>Loading trusted websites...</p>
-        ) : trustedSites.length === 0 ? (
-          <p style={{ margin: 0, color: "var(--text-muted)", fontSize: "13px" }}>
-            No trusted websites yet.
-          </p>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-            {trustedSites.map((site) => {
-              const draft = trustedSiteDrafts[site.origin] ?? {
-                getPublicKeyPolicy: site.getPublicKeyPolicy,
-                signPolicy: site.signPolicy,
-                boundProfileId: site.boundProfileId ?? "",
-              };
+            {trustedSitesLoading ? (
+              <p style={{ margin: 0, color: "var(--text-muted)", fontSize: "13px" }}>Loading trusted websites...</p>
+            ) : trustedSites.length === 0 ? (
+              <p style={{ margin: 0, color: "var(--text-muted)", fontSize: "13px" }}>
+                No trusted websites yet.
+              </p>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                {trustedSites.map((site) => {
+                  const draft = trustedSiteDrafts[site.origin] ?? {
+                    getPublicKeyPolicy: site.getPublicKeyPolicy,
+                    signPolicy: site.signPolicy,
+                    boundProfileId: site.boundProfileId ?? "",
+                  };
+                  const isExpanded = expandedTrustedSites.has(site.origin);
 
-              return (
-                <div
-                  key={site.origin}
-                  style={{
-                    border: "1px solid var(--border-muted)",
-                    borderRadius: "8px",
-                    padding: "10px",
-                    background: "var(--surface-muted)",
-                  }}
-                >
-                  <div style={{ marginBottom: "8px" }}>
+                  return (
                     <div
+                      key={site.origin}
                       style={{
-                        fontFamily: "monospace",
-                        fontSize: "12px",
-                        color: "var(--text-primary)",
-                        wordBreak: "break-all",
+                        border: "1px solid var(--border-muted)",
+                        borderRadius: "8px",
+                        padding: "10px",
+                        background: "var(--surface-muted)",
                       }}
                     >
-                      {site.origin}
-                    </div>
-                  </div>
+                      <button
+                        onClick={() =>
+                          setExpandedTrustedSites((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(site.origin)) next.delete(site.origin);
+                            else next.add(site.origin);
+                            return next;
+                          })
+                        }
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          width: "100%",
+                          background: "none",
+                          border: "none",
+                          cursor: "pointer",
+                          padding: 0,
+                          marginBottom: isExpanded ? "8px" : 0,
+                          color: "var(--text-primary)",
+                        }}
+                      >
+                        <span
+                          style={{
+                            fontFamily: "monospace",
+                            fontSize: "12px",
+                            color: "var(--text-primary)",
+                            wordBreak: "break-all",
+                            textAlign: "left",
+                          }}
+                        >
+                          {site.origin}
+                        </span>
+                        <span style={{ fontSize: "11px", color: "var(--text-muted)", marginLeft: "8px", flexShrink: 0 }}>
+                          {isExpanded ? "▲" : "▼"}
+                        </span>
+                      </button>
 
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
+                      <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "4px" }}>
+                        {site.signAllowAll
+                          ? "Allowed sign kinds: all"
+                          : site.allowedSignKinds.length
+                            ? `Allowed sign kinds: ${site.allowedSignKinds
+                                .map((kind) => `${kind} (${describeEventKind(kind)})`)
+                                .join(", ")}`
+                            : "Allowed sign kinds: none"}
+                      </div>
+
+                      {isExpanded && (
+                        <>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
                     <label style={{ fontSize: "12px", color: "var(--text-muted)" }}>
                       Public key access
                       <select
@@ -1824,45 +1924,47 @@ export default function App() {
                     </label>
                   </div>
 
-                  <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
-                    <button
-                      onClick={() => {
-                        void handleSaveTrustedWebsite(site.origin);
-                      }}
-                      style={{
-                        flex: 1,
-                        padding: "9px 10px",
-                        background: "var(--primary-action-bg)",
-                        color: "var(--primary-action-text)",
-                        border: "none",
-                        borderRadius: "6px",
-                        cursor: "pointer",
-                      }}
-                    >
-                      Save
-                    </button>
-                    <button
-                      onClick={() => {
-                        void handleRemoveTrustedWebsite(site.origin);
-                      }}
-                      style={{
-                        flex: 1,
-                        padding: "9px 10px",
-                        background: "var(--surface-soft)",
-                        color: "var(--text-primary)",
-                        border: "1px solid var(--border-muted)",
-                        borderRadius: "6px",
-                        cursor: "pointer",
-                      }}
-                    >
-                      Forget
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
+                    <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
+                        <button
+                          onClick={() => {
+                            void handleSaveTrustedWebsite(site.origin);
+                          }}
+                          style={{
+                            flex: 1,
+                            padding: "9px 10px",
+                            background: "var(--primary-action-bg)",
+                            color: "var(--primary-action-text)",
+                            border: "none",
+                            borderRadius: "6px",
+                            cursor: "pointer",
+                          }}
+                        >
+                          Save
+                        </button>
+                        <button
+                          onClick={() => {
+                            void handleRemoveTrustedWebsite(site.origin);
+                          }}
+                          style={{
+                            flex: 1,
+                            padding: "9px 10px",
+                            background: "var(--surface-soft)",
+                            color: "var(--text-primary)",
+                            border: "1px solid var(--border-muted)",
+                            borderRadius: "6px",
+                            cursor: "pointer",
+                          }}
+                        >
+                          Forget
+                        </button>
+                      </div>
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
       </div>
 
       {/* Create Modal */}
