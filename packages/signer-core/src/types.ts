@@ -29,6 +29,8 @@ export interface VaultState {
   activeIdentityId: string | null;
   // Global PIN hash
   pinHash?: string;
+  // Salt for PIN-based key derivation
+  pinSalt?: string;
   // Session state (never persisted)
   unlockedAt: number | null;
   masterKey: string | null;

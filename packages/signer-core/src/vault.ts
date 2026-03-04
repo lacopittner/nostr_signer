@@ -1,4 +1,5 @@
-import { computeEventId, serializeEvent } from "./nostr";
+import { computeEventId, serializeEvent, deriveKeyFromPin } from "./nostr";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 import type {
   IdentityRecord,
   SignEventInput,
@@ -8,6 +9,7 @@ import type {
   VaultState,
   VaultStorage,
 } from "./types";
+import { hashPassword } from "./nostr";
 
 const DEFAULT_UNLOCK_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_COLOR_POOL = [
@@ -34,6 +36,7 @@ export function createEmptyVaultState(): VaultState {
     activeIdentityId: null,
     unlockedAt: null,
     masterKey: null, // In-memory only, never persisted
+    pinSalt: undefined,   // Salt for PIN-based key derivation
   };
 }
 
@@ -83,8 +86,12 @@ export class IdentityVault {
 
   async setPin(pin: string): Promise<void> {
     await this.ensureLoaded();
+    
+    // Generate salt for key derivation
+    const salt = crypto.getRandomValues(new Uint8Array(16));
     const { hashPassword } = await import("./nostr");
     this.state.pinHash = await hashPassword(pin);
+    this.state.pinSalt = bytesToHex(salt);
     await this.persist();
   }
 
@@ -92,15 +99,23 @@ export class IdentityVault {
     await this.ensureLoaded();
     if (!this.state.pinHash) return false;
     
-    const { hashPassword } = await import("./nostr");
-    const hash = await hashPassword(pin);
-    return hash === this.state.pinHash;
+    const { verifyPassword } = await import("./nostr");
+    return verifyPassword(pin, this.state.pinHash);
   }
 
   async unlock(pin: string, ttlMs: number = DEFAULT_UNLOCK_TTL_MS): Promise<boolean> {
     const valid = await this.verifyPin(pin);
     if (!valid) return false;
 
+    // Derive master key from PIN
+    if (!this.state.pinSalt) {
+      throw new Error("PIN salt not set");
+    }
+    const salt = hexToBytes(this.state.pinSalt);
+    const { deriveKeyFromPin } = await import("./nostr");
+    const { key } = await deriveKeyFromPin(pin, salt);
+    this.state.masterKey = key;
+    
     this.state.unlockedAt = this.now() + ttlMs;
     await this.persist();
     return true;
@@ -313,9 +328,9 @@ export class IdentityVault {
     const unlocked = await this.isUnlocked();
     if (!unlocked) throw new Error("Vault is locked");
     
-    // Initialize master key if needed (simplified - in real app use proper key derivation)
+    // Master key should already be set from unlock(), verify it exists
     if (!this.state.masterKey) {
-      this.state.masterKey = await this.deriveMasterKey();
+      throw new Error("Vault master key not initialized - unlock with PIN first");
     }
   }
 
@@ -324,8 +339,26 @@ export class IdentityVault {
   }
 
   private async deriveMasterKey(): Promise<string> {
-    // Simplified - in production use proper key derivation from PIN
-    return "master-key-placeholder";
+    // Derive master key from PIN using stored salt
+    if (!this.state.pinSalt) {
+      throw new Error("PIN salt not set");
+    }
+    const salt = hexToBytes(this.state.pinSalt);
+    const { deriveKeyFromPin } = await import("./nostr");
+    const { key } = await deriveKeyFromPin("", salt);
+    return key;
+  }
+  
+  /**
+   * Set the PIN and derive master key in one step (for initial setup)
+   */
+  async setupPin(pin: string): Promise<void> {
+    await this.ensureLoaded();
+    const { deriveKeyFromPin } = await import("./nostr");
+    const { key, salt } = await deriveKeyFromPin(pin);
+    this.state.pinSalt = salt;
+    this.state.masterKey = key;
+    await this.persist();
   }
 
   private async encryptWithMasterKey(data: string): Promise<string> {

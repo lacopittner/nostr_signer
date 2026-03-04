@@ -18,6 +18,9 @@ const MAX_REQUESTS_PER_WINDOW = 20;
 // Rate limit tracking with automatic cleanup
 const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
 
+// Separate rate limit for always_allow policy (lower limits since it's auto-approved)
+const alwaysAllowRateLimitMap = new Map<string, { count: number; resetTime: number }>();
+
 function checkRateLimit(origin: string): boolean {
   const now = Date.now();
   const current = rateLimitMap.get(origin);
@@ -36,6 +39,25 @@ function checkRateLimit(origin: string): boolean {
   return true;
 }
 
+function checkAlwaysAllowRateLimit(origin: string): boolean {
+  const now = Date.now();
+  const current = alwaysAllowRateLimitMap.get(origin);
+
+  if (!current || current.resetTime < now) {
+    alwaysAllowRateLimitMap.set(origin, { count: 1, resetTime: now + ALWAYS_ALLOW_RATE_LIMIT_WINDOW_MS });
+    return true;
+  }
+
+  if (current.count >= MAX_ALWAYS_ALLOW_REQUESTS_PER_WINDOW) {
+    console.warn(`[Nostr Signer] Rate limit exceeded for always_allow origin: ${origin}`);
+    return false;
+  }
+
+  current.count++;
+  alwaysAllowRateLimitMap.set(origin, current);
+  return true;
+}
+
 function clearExpiredRateLimits(now: number) {
   for (const [origin, data] of rateLimitMap) {
     if (data.resetTime < now) {
@@ -49,6 +71,10 @@ const DEFAULT_RELAYS: Record<string, { read: boolean; write: boolean }> = {
   "wss://nos.lol": { read: true, write: true },
   "wss://relay.primal.net": { read: true, write: true },
 };
+
+// Rate limits apply to ALL policies including always_allow
+const ALWAYS_ALLOW_RATE_LIMIT_WINDOW_MS = 60_000;
+const MAX_ALWAYS_ALLOW_REQUESTS_PER_WINDOW = 50;
 
 type SignPolicyMode = "always_allow" | "always_reject";
 
@@ -187,6 +213,11 @@ browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.r
         const unlocked = await vault.isUnlocked();
 
         if (policy?.mode === "always_allow") {
+          // Apply rate limiting even for always_allow
+          if (!checkAlwaysAllowRateLimit(requestOrigin)) {
+            return { error: "Rate limit exceeded for this trusted website" };
+          }
+          
           if (unlocked) {
             if (requestOrigin !== "unknown") {
               await bindOriginProfile(requestOrigin, selectedIdentity.id);
@@ -250,6 +281,11 @@ browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.r
         }
 
         if (policy?.mode === "always_allow") {
+          // Apply rate limiting even for always_allow
+          if (!checkAlwaysAllowRateLimit(requestOrigin)) {
+            return { error: "Rate limit exceeded for this trusted website" };
+          }
+          
           const policyIdentity = await resolveIdentityById(policy.identityId ?? null);
           const selectedIdentity = policyIdentity ?? identity;
           const unlocked = await vault.isUnlocked();
@@ -1250,26 +1286,76 @@ function getSenderOrigin(sender: browser.runtime.MessageSender): string {
 }
 
 function verifyOriginMatch(claimedOrigin: string, senderOrigin: string): boolean {
-  // Allow "unknown" as fallback for legacy compatibility
-  if (claimedOrigin === "unknown") {
-    return true;
+  // Reject unknown origins - must have a valid, verifiable origin
+  if (claimedOrigin === "unknown" || !claimedOrigin) {
+    console.warn(`[Nostr Signer] Rejected: unknown origin`);
+    return false;
   }
   // Verify the claimed origin matches the actual sender origin
   return claimedOrigin === senderOrigin;
+}
+
+// Whitelist of allowed tag types (first element of each tag)
+const ALLOWED_TAG_TYPES = new Set([
+  "p",           // Pubkey reference
+  "e",           // Event reference
+  "a",           // Addressable event (kind:channel)
+  "r",           // Relay URL
+  "t",           // Trending topic
+  "g",           // Geohash
+  "i",           // Identifier
+  "d",           // D tag (duplicate prevention)
+  "nonce",       // Nonce for PoW
+  "expiration", // Expiration time
+  "k",           // Kind
+]);
+
+// Maximum tag length to prevent DoS
+const MAX_TAG_LENGTH = 1024;
+const MAX_TAG_COUNT = 100;
+const MAX_CONTENT_LENGTH = 100000;
+
+function validateTag(tag: string[]): string[] | null {
+  if (!tag.length) return null;
+  
+  const tagType = tag[0].toLowerCase();
+  if (!ALLOWED_TAG_TYPES.has(tagType)) {
+    return null; // Reject unknown tag types
+  }
+  
+  // Validate each tag element
+  const validated = tag.map((item) => {
+    const str = String(item);
+    if (str.length > MAX_TAG_LENGTH) {
+      return str.slice(0, MAX_TAG_LENGTH);
+    }
+    return str;
+  });
+  
+  return validated;
 }
 
 function normalizeSignEventPayload(payload: unknown): SignEventPayload {
   const source = toRecord(payload);
 
   const kind = asFiniteNumber(source.kind) ?? 1;
-  const content = asString(source.content) || "";
+  
+  // Validate and truncate content
+  let content = asString(source.content) || "";
+  if (content.length > MAX_CONTENT_LENGTH) {
+    content = content.slice(0, MAX_CONTENT_LENGTH);
+  }
+  
   const createdAtRaw = asFiniteNumber(source.created_at);
   const createdAt = typeof createdAtRaw === "number" ? Math.trunc(createdAtRaw) : undefined;
 
   const tagsSource = Array.isArray(source.tags) ? source.tags : [];
   const tags = tagsSource
     .filter((entry): entry is unknown[] => Array.isArray(entry))
-    .map((entry) => entry.map((item) => String(item)));
+    .slice(0, MAX_TAG_COUNT) // Limit number of tags
+    .map((entry) => entry.map((item) => String(item)))
+    .map(validateTag)
+    .filter((tag): tag is string[] => tag !== null);
 
   return {
     kind,
