@@ -1081,17 +1081,31 @@ export default function App() {
 
   const handleUnlock = async (pin: string, remember: boolean): Promise<boolean> => {
     const ttl = remember ? SESSION_UNLOCK_TTL_MS : DEFAULT_UNLOCK_TTL_MS;
+    console.info("[nostr-signer][pin] popup:unlock:start", {
+      remember,
+      ttl,
+      pinLength: pin.length,
+    });
     const success = await vault.unlock(pin, ttl);
-    if (!success) return false;
+    if (!success) {
+      console.warn("[nostr-signer][pin] popup:unlock:local-vault-failed");
+      return false;
+    }
     try {
       const response = await browser.runtime.sendMessage({ type: "UNLOCK_VAULT", pin, ttlMs: ttl });
       if (response?.error) {
+        console.warn("[nostr-signer][pin] popup:unlock:background-error", {
+          error: response.error,
+        });
         throw new Error(response.error);
       }
     } catch {
+      console.warn("[nostr-signer][pin] popup:unlock:background-sync-failed");
       await vault.lock();
       return false;
     }
+
+    console.info("[nostr-signer][pin] popup:unlock:success");
 
     setRememberUnlock(remember);
     try {

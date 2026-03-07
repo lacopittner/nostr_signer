@@ -183,12 +183,22 @@ browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.r
   const data = toRecord(message);
   const type = asString(data.type);
 
-  // Verify origin matches sender for security
+  // Verify origin matches sender for external website requests.
   const claimedOrigin = parseRequestOrigin(data.origin);
   const senderOrigin = getSenderOrigin(sender);
-  if (!verifyOriginMatch(claimedOrigin, senderOrigin)) {
-    console.warn(`[Nostr Signer] Origin mismatch: claimed=${claimedOrigin}, sender=${senderOrigin}`);
-    return { error: "Origin verification failed" };
+
+  if (type.startsWith("NOSTR_")) {
+    if (!verifyOriginMatch(claimedOrigin, senderOrigin)) {
+      console.warn(`[Nostr Signer] Origin mismatch: claimed=${claimedOrigin}, sender=${senderOrigin}`);
+      return { error: "Origin verification failed" };
+    }
+  } else {
+    // Internal extension messages (popup/options/background) are allowed
+    // without website origin claims but must come from this extension.
+    if (!isTrustedInternalSender(sender, senderOrigin)) {
+      console.warn(`[Nostr Signer] Rejected internal message from untrusted sender: ${senderOrigin}`);
+      return { error: "Sender verification failed" };
+    }
   }
 
   switch (type) {
@@ -440,13 +450,21 @@ browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.r
         await vault.reload();
         const pin = asString(data.pin);
         const ttlMs = asFiniteNumber(data.ttlMs);
+        console.info("[nostr-signer][pin] background:unlock:start", {
+          hasPin: Boolean(pin),
+          pinLength: pin?.length ?? 0,
+          ttlMs: ttlMs ?? null,
+        });
         if (!pin) {
+          console.warn("[nostr-signer][pin] background:unlock:missing-pin");
           return { error: "PIN is required" };
         }
         const unlocked = await vault.unlock(pin, ttlMs ?? undefined);
         if (!unlocked) {
+          console.warn("[nostr-signer][pin] background:unlock:invalid-pin");
           return { error: "Invalid PIN" };
         }
+        console.info("[nostr-signer][pin] background:unlock:success");
         try {
           await browser.storage.local.set({ [LOCKED_STATE_KEY]: false });
         } catch {
@@ -1283,6 +1301,16 @@ function getSenderOrigin(sender: browser.runtime.MessageSender): string {
     return sender.origin;
   }
   return "";
+}
+
+function isTrustedInternalSender(sender: browser.runtime.MessageSender, senderOrigin: string): boolean {
+  if (sender.id && sender.id === browser.runtime.id) {
+    return true;
+  }
+
+  const extensionOrigin = `chrome-extension://${browser.runtime.id}`;
+  const firefoxExtensionOrigin = `moz-extension://${browser.runtime.id}`;
+  return senderOrigin === extensionOrigin || senderOrigin === firefoxExtensionOrigin;
 }
 
 function verifyOriginMatch(claimedOrigin: string, senderOrigin: string): boolean {

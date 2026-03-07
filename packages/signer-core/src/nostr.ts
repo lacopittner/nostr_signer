@@ -232,11 +232,12 @@ export async function verifyPassword(password: string, storedHash: string): Prom
     );
     
     const derivedKey = new Uint8Array(derivedBits);
+    const storedKeyView = new Uint8Array(storedKey);
     // Constant-time comparison
-    if (derivedKey.length !== storedKey.length) return false;
+    if (derivedKey.length !== storedKeyView.length) return false;
     let result = 0;
     for (let i = 0; i < derivedKey.length; i++) {
-      result |= derivedKey[i] ^ storedKey[i];
+      result |= derivedKey[i]! ^ storedKeyView[i]!;
     }
     return result === 0;
   } catch {
@@ -259,7 +260,7 @@ export async function deriveKeyFromPin(pin: string, salt?: Uint8Array): Promise<
   const derivedBits = await crypto.subtle.deriveBits(
     {
       name: "PBKDF2",
-      salt: useSalt,
+      salt: useSalt as BufferSource,
       iterations: 100000,
       hash: "SHA-256",
     },

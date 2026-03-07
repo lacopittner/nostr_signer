@@ -1,4 +1,4 @@
-import { computeEventId, serializeEvent, deriveKeyFromPin } from "./nostr";
+import { computeEventId, serializeEvent } from "./nostr";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 import type {
   IdentityRecord,
@@ -9,7 +9,6 @@ import type {
   VaultState,
   VaultStorage,
 } from "./types";
-import { hashPassword } from "./nostr";
 
 const DEFAULT_UNLOCK_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_COLOR_POOL = [
@@ -97,27 +96,76 @@ export class IdentityVault {
 
   async verifyPin(pin: string): Promise<boolean> {
     await this.ensureLoaded();
-    if (!this.state.pinHash) return false;
-    
+    if (!this.state.pinHash) {
+      console.warn("[nostr-signer][pin] verifyPin: pinHash missing in state");
+      return false;
+    }
+
+    console.info("[nostr-signer][pin] verifyPin:start", {
+      inputPinLength: pin.length,
+      pinHashLength: this.state.pinHash.length,
+      hasPinSalt: Boolean(this.state.pinSalt),
+      hashFormat: this.state.pinHash.length === 64 ? "legacy-sha256" : "pbkdf2",
+    });
+
+    // Legacy format support: older vaults stored plain SHA-256 (64 hex chars).
+    if (this.state.pinHash.length === 64) {
+      const data = new TextEncoder().encode(pin);
+      const digest = await crypto.subtle.digest("SHA-256", data);
+      const hashHex = bytesToHex(new Uint8Array(digest));
+      const ok = hashHex === this.state.pinHash;
+      console.info("[nostr-signer][pin] verifyPin:legacy-result", { ok });
+      return ok;
+    }
+
     const { verifyPassword } = await import("./nostr");
-    return verifyPassword(pin, this.state.pinHash);
+    const ok = await verifyPassword(pin, this.state.pinHash);
+    console.info("[nostr-signer][pin] verifyPin:pbkdf2-result", { ok });
+    return ok;
   }
 
   async unlock(pin: string, ttlMs: number = DEFAULT_UNLOCK_TTL_MS): Promise<boolean> {
-    const valid = await this.verifyPin(pin);
-    if (!valid) return false;
+    console.info("[nostr-signer][pin] unlock:start", {
+      ttlMs,
+      hasPinHash: Boolean(this.state.pinHash),
+      hasPinSalt: Boolean(this.state.pinSalt),
+    });
 
-    // Derive master key from PIN
-    if (!this.state.pinSalt) {
-      throw new Error("PIN salt not set");
+    const valid = await this.verifyPin(pin);
+    if (!valid) {
+      console.warn("[nostr-signer][pin] unlock:verify-failed");
+      return false;
     }
-    const salt = hexToBytes(this.state.pinSalt);
+
     const { deriveKeyFromPin } = await import("./nostr");
-    const { key } = await deriveKeyFromPin(pin, salt);
+
+    // Ensure key-derivation salt exists. Some legacy states may not have pinSalt.
+    let key: string;
+    if (!this.state.pinSalt) {
+      const derived = await deriveKeyFromPin(pin);
+      this.state.pinSalt = derived.salt;
+      key = derived.key;
+      console.info("[nostr-signer][pin] unlock:generated-missing-pinSalt");
+    } else {
+      const salt = hexToBytes(this.state.pinSalt);
+      const derived = await deriveKeyFromPin(pin, salt);
+      key = derived.key;
+    }
+
+    // Migrate legacy SHA-256 PIN hash to PBKDF2 format on successful unlock.
+    if (this.state.pinHash && this.state.pinHash.length === 64) {
+      const { hashPassword } = await import("./nostr");
+      this.state.pinHash = await hashPassword(pin);
+      console.info("[nostr-signer][pin] unlock:migrated-legacy-pinHash");
+    }
+
     this.state.masterKey = key;
     
     this.state.unlockedAt = this.now() + ttlMs;
     await this.persist();
+    console.info("[nostr-signer][pin] unlock:success", {
+      unlockedUntil: this.state.unlockedAt,
+    });
     return true;
   }
 
@@ -354,8 +402,10 @@ export class IdentityVault {
    */
   async setupPin(pin: string): Promise<void> {
     await this.ensureLoaded();
+    const { hashPassword } = await import("./nostr");
     const { deriveKeyFromPin } = await import("./nostr");
     const { key, salt } = await deriveKeyFromPin(pin);
+    this.state.pinHash = await hashPassword(pin);
     this.state.pinSalt = salt;
     this.state.masterKey = key;
     await this.persist();
