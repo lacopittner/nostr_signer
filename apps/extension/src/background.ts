@@ -450,10 +450,12 @@ browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.r
         await vault.reload();
         const pin = asString(data.pin);
         const ttlMs = asFiniteNumber(data.ttlMs);
+        const remember = true;
         console.info("[nostr-signer][pin] background:unlock:start", {
           hasPin: Boolean(pin),
           pinLength: pin?.length ?? 0,
           ttlMs: ttlMs ?? null,
+          remember,
         });
         if (!pin) {
           console.warn("[nostr-signer][pin] background:unlock:missing-pin");
@@ -466,7 +468,13 @@ browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.r
         }
         console.info("[nostr-signer][pin] background:unlock:success");
         try {
-          await browser.storage.local.set({ [LOCKED_STATE_KEY]: false });
+          await Promise.all([
+            browser.storage.local.set({
+              [LOCKED_STATE_KEY]: false,
+              [REMEMBER_UNLOCK_KEY]: true,
+            }),
+            browser.storage.session.set({ [SESSION_UNLOCK_KEY]: true }),
+          ]);
         } catch {
           // Ignore lock-state sync errors.
         }
@@ -480,7 +488,10 @@ browser.runtime.onMessage.addListener(async (message: unknown, sender: browser.r
       try {
         await vault.lock();
         try {
-          await browser.storage.local.set({ [LOCKED_STATE_KEY]: true });
+          await Promise.all([
+            browser.storage.local.set({ [LOCKED_STATE_KEY]: true }),
+            browser.storage.session.remove(SESSION_UNLOCK_KEY),
+          ]);
         } catch {
           // Ignore lock-state sync errors.
         }
@@ -1016,37 +1027,8 @@ async function resolveApprovedIdentityId(
 }
 
 async function enforceBackgroundLockPolicy() {
-  try {
-    const result = await browser.storage.local.get(LOCKED_STATE_KEY);
-    if (result[LOCKED_STATE_KEY] === true) {
-      const unlocked = await vault.isUnlocked();
-      if (unlocked) {
-        await vault.lock();
-      }
-      return;
-    }
-  } catch {
-    // Ignore explicit lock read errors.
-  }
-
-  let remember = true;
-
-  try {
-    const result = await browser.storage.local.get(REMEMBER_UNLOCK_KEY);
-    if (typeof result[REMEMBER_UNLOCK_KEY] === "boolean") {
-      remember = result[REMEMBER_UNLOCK_KEY] as boolean;
-    }
-  } catch {
-    // Ignore preference read errors.
-  }
-
   const unlocked = await vault.isUnlocked();
   if (!unlocked) return;
-
-  if (!remember) {
-    await vault.lock();
-    return;
-  }
 
   try {
     const session = await browser.storage.session.get(SESSION_UNLOCK_KEY);
@@ -1060,6 +1042,11 @@ async function enforceBackgroundLockPolicy() {
 }
 
 async function signEventWithIdentity(payload: SignEventPayload, identityId: string): Promise<SignedNostrEvent> {
+  const unlocked = await vault.isUnlocked();
+  if (!unlocked) {
+    throw new Error("Vault is locked. Unlock with PIN first");
+  }
+
   return vault.signEvent({
     kind: payload.kind,
     content: payload.content,

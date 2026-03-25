@@ -9,7 +9,6 @@ const REMEMBER_UNLOCK_KEY = "nostr_signer_remember_unlock";
 const SESSION_UNLOCK_KEY = "nostr_signer_session_unlock";
 const LOCKED_STATE_KEY = "nostr_signer_locked";
 const DEFAULT_PROFILE_KEY = "nostr_signer_default_profile_id";
-const DEFAULT_UNLOCK_TTL_MS = 15 * 60 * 1000;
 const SESSION_UNLOCK_TTL_MS = 365 * 24 * 60 * 60 * 1000;
 
 type TrustedSignPolicyMode = "ask" | "always_allow" | "always_reject";
@@ -958,24 +957,15 @@ export default function App() {
 
   useEffect(() => {
     const init = async () => {
-      let rememberPref = true;
-      let forcedLocked = false;
+      const rememberPref = true;
       try {
         const result = await browser.storage.local.get([
           THEME_STORAGE_KEY,
-          REMEMBER_UNLOCK_KEY,
-          LOCKED_STATE_KEY,
           DEFAULT_PROFILE_KEY,
         ]);
         const storedTheme = result[THEME_STORAGE_KEY];
         if (storedTheme === "light" || storedTheme === "dark") {
           setTheme(storedTheme);
-        }
-        if (typeof result[REMEMBER_UNLOCK_KEY] === "boolean") {
-          rememberPref = result[REMEMBER_UNLOCK_KEY];
-        }
-        if (result[LOCKED_STATE_KEY] === true) {
-          forcedLocked = true;
         }
         if (typeof result[DEFAULT_PROFILE_KEY] === "string") {
           setDefaultProfileId(result[DEFAULT_PROFILE_KEY]);
@@ -992,48 +982,7 @@ export default function App() {
         setHasPin(pinSet);
         
         if (pinSet) {
-          let unlocked = await vault.isUnlocked();
-          if (forcedLocked && unlocked) {
-            await vault.lock();
-            try {
-              await browser.runtime.sendMessage({ type: "LOCK_VAULT" });
-            } catch {
-              // ignore background sync errors
-            }
-            unlocked = false;
-          } else if (unlocked) {
-            if (!rememberPref) {
-              await vault.lock();
-              try {
-                await browser.runtime.sendMessage({ type: "LOCK_VAULT" });
-              } catch {
-                // ignore background sync errors
-              }
-              unlocked = false;
-            } else {
-              try {
-                const session = await browser.storage.session.get(SESSION_UNLOCK_KEY);
-                const sessionAllowed = Boolean(session[SESSION_UNLOCK_KEY]);
-                if (!sessionAllowed) {
-                  await vault.lock();
-                  try {
-                    await browser.runtime.sendMessage({ type: "LOCK_VAULT" });
-                  } catch {
-                    // ignore background sync errors
-                  }
-                  unlocked = false;
-                }
-              } catch {
-                await vault.lock();
-                try {
-                  await browser.runtime.sendMessage({ type: "LOCK_VAULT" });
-                } catch {
-                  // ignore background sync errors
-                }
-                unlocked = false;
-              }
-            }
-          }
+          const unlocked = await vault.isUnlocked();
 
           try {
             await browser.storage.local.set({ [LOCKED_STATE_KEY]: !unlocked });
@@ -1080,7 +1029,7 @@ export default function App() {
   };
 
   const handleUnlock = async (pin: string, remember: boolean): Promise<boolean> => {
-    const ttl = remember ? SESSION_UNLOCK_TTL_MS : DEFAULT_UNLOCK_TTL_MS;
+    const ttl = SESSION_UNLOCK_TTL_MS;
     console.info("[nostr-signer][pin] popup:unlock:start", {
       remember,
       ttl,
@@ -1092,7 +1041,7 @@ export default function App() {
       return false;
     }
     try {
-      const response = await browser.runtime.sendMessage({ type: "UNLOCK_VAULT", pin, ttlMs: ttl });
+      const response = await browser.runtime.sendMessage({ type: "UNLOCK_VAULT", pin, ttlMs: ttl, remember: true });
       if (response?.error) {
         console.warn("[nostr-signer][pin] popup:unlock:background-error", {
           error: response.error,
@@ -1107,17 +1056,13 @@ export default function App() {
 
     console.info("[nostr-signer][pin] popup:unlock:success");
 
-    setRememberUnlock(remember);
+    setRememberUnlock(true);
     try {
       await browser.storage.local.set({
-        [REMEMBER_UNLOCK_KEY]: remember,
+        [REMEMBER_UNLOCK_KEY]: true,
         [LOCKED_STATE_KEY]: false,
       });
-      if (remember) {
-        await browser.storage.session.set({ [SESSION_UNLOCK_KEY]: true });
-      } else {
-        await browser.storage.session.remove(SESSION_UNLOCK_KEY);
-      }
+      await browser.storage.session.set({ [SESSION_UNLOCK_KEY]: true });
     } catch {
       // Ignore preference save errors
     }
@@ -1131,7 +1076,7 @@ export default function App() {
 
   const handleSetupComplete = async (pin: string, remember: boolean) => {
     await vault.setPin(pin);
-    const ttl = remember ? SESSION_UNLOCK_TTL_MS : DEFAULT_UNLOCK_TTL_MS;
+    const ttl = SESSION_UNLOCK_TTL_MS;
     const success = await vault.unlock(pin, ttl);
     if (!success) {
       setHasPin(true);
@@ -1140,7 +1085,7 @@ export default function App() {
       return;
     }
     try {
-      const response = await browser.runtime.sendMessage({ type: "UNLOCK_VAULT", pin, ttlMs: ttl });
+      const response = await browser.runtime.sendMessage({ type: "UNLOCK_VAULT", pin, ttlMs: ttl, remember: true });
       if (response?.error) {
         throw new Error(response.error);
       }
@@ -1152,17 +1097,13 @@ export default function App() {
       return;
     }
 
-    setRememberUnlock(remember);
+    setRememberUnlock(true);
     try {
       await browser.storage.local.set({
-        [REMEMBER_UNLOCK_KEY]: remember,
+        [REMEMBER_UNLOCK_KEY]: true,
         [LOCKED_STATE_KEY]: false,
       });
-      if (remember) {
-        await browser.storage.session.set({ [SESSION_UNLOCK_KEY]: true });
-      } else {
-        await browser.storage.session.remove(SESSION_UNLOCK_KEY);
-      }
+      await browser.storage.session.set({ [SESSION_UNLOCK_KEY]: true });
     } catch {
       // Ignore preference save errors
     }
@@ -1233,28 +1174,24 @@ export default function App() {
         throw new Error("Current PIN is incorrect");
       }
 
-      const ttl = changePinRemember ? SESSION_UNLOCK_TTL_MS : DEFAULT_UNLOCK_TTL_MS;
+      const ttl = SESSION_UNLOCK_TTL_MS;
       const unlocked = await vault.unlock(nextPinInput, ttl);
       if (!unlocked) {
         throw new Error("Failed to unlock with new PIN");
       }
 
-      const response = await browser.runtime.sendMessage({ type: "UNLOCK_VAULT", pin: nextPinInput, ttlMs: ttl });
+      const response = await browser.runtime.sendMessage({ type: "UNLOCK_VAULT", pin: nextPinInput, ttlMs: ttl, remember: true });
       if (response?.error) {
         throw new Error(response.error);
       }
 
-      setRememberUnlock(changePinRemember);
+      setRememberUnlock(true);
       try {
         await browser.storage.local.set({
-          [REMEMBER_UNLOCK_KEY]: changePinRemember,
+          [REMEMBER_UNLOCK_KEY]: true,
           [LOCKED_STATE_KEY]: false,
         });
-        if (changePinRemember) {
-          await browser.storage.session.set({ [SESSION_UNLOCK_KEY]: true });
-        } else {
-          await browser.storage.session.remove(SESSION_UNLOCK_KEY);
-        }
+        await browser.storage.session.set({ [SESSION_UNLOCK_KEY]: true });
       } catch {
         // Ignore preference save errors
       }

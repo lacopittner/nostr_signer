@@ -367,7 +367,6 @@ export class IdentityVault {
     
     const existing = await this.storage.load();
     this.state = existing ?? createEmptyVaultState();
-    this.state.masterKey = null; // Always clear on load
     this.loaded = true;
   }
 
